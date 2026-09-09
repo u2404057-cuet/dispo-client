@@ -1,0 +1,636 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { useForm } from "react-hook-form";
+import { QRCodeSVG } from "qrcode.react";
+import Link from "next/link";
+import {
+  Server,
+  Box,
+  ArrowLeft,
+  CircleCheck,
+  TriangleExclamation,
+  PlugConnection,
+  Pencil,
+  TrashBin,
+  Printer,
+  Tag,
+  TagDollar,
+  Boxes3,
+  Picture,
+  ArrowRight,
+} from "@gravity-ui/icons";
+import { Modal, toast, useOverlayState, Spinner } from "@heroui/react";
+
+const DEVICE_TYPE_LABELS = {
+  coffee_machine: "Coffee Machine",
+  vending_machine: "Vending Machine",
+  juice_machine: "Juice Machine",
+};
+
+export default function ManageDeviceDetailPage() {
+  const { id } = useParams();
+  const router = useRouter();
+  const [device, setDevice] = useState(null);
+  const [ownerName, setOwnerName] = useState(null);
+  const [products, setProducts] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const editModal = useOverlayState();
+  const editForm = useForm({ defaultValues: { name: "", slotCount: "", status: "active" } });
+
+  const deleteModal = useOverlayState();
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // Add-product form — scoped to just this device, no dropdown needed
+  // since we already know which device we're on from the URL.
+  const {
+    register: registerProduct,
+    handleSubmit: handleProductSubmit,
+    reset: resetProductForm,
+    formState: { isSubmitting: isAddingProduct },
+  } = useForm({ defaultValues: { name: "", description: "", price: "", stock: "", slotNumber: "" } });
+  const [addImagePreview, setAddImagePreview] = useState(null);
+  const [addImageBase64, setAddImageBase64] = useState(null);
+
+  const takenSlots = useMemo(() => new Set(products.map((p) => p.slotNumber)), [products]);
+  const availableSlots = device?.slotCount
+    ? Array.from({ length: device.slotCount }, (_, i) => i + 1)
+    : [];
+
+  const handleImageFile = (file) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      toast.danger("Not an image", { description: "Please choose an image file." });
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.danger("Image too large", { description: "Please choose an image under 2MB." });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setAddImagePreview(reader.result);
+      setAddImageBase64(reader.result);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const onAddProduct = async (data) => {
+    try {
+      const res = await fetch("/api/proxy/products", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...data, deviceId: device._id, image: addImageBase64 }),
+      });
+      const created = await res.json();
+      if (!res.ok) {
+        toast.danger("Couldn't add product", { description: created.error || "Please try again." });
+        return;
+      }
+      setProducts((prev) => [...prev, created]);
+      resetProductForm();
+      setAddImagePreview(null);
+      setAddImageBase64(null);
+      toast.success("Product added", { description: `${created.name} was added to ${device.name}.` });
+    } catch (error) {
+      console.log(error);
+      toast.danger("Couldn't add product", { description: "Something went wrong." });
+    }
+  };
+
+  const load = async () => {
+    setIsLoading(true);
+    try {
+      const [devicesRes, usersRes, productsRes] = await Promise.all([
+        fetch("/api/proxy/devices"),
+        fetch("/api/proxy/users"),
+        fetch(`/api/proxy/products?deviceId=${id}`),
+      ]);
+      const devices = await devicesRes.json();
+      const users = await usersRes.json();
+      const foundDevice = Array.isArray(devices) ? devices.find((d) => d._id === id) : null;
+      setDevice(foundDevice || null);
+      if (foundDevice?.ownerId) {
+        const owner = users.find((u) => u._id === foundDevice.ownerId);
+        setOwnerName(owner?.name || owner?.email || "Unknown");
+      }
+      setProducts(await productsRes.json());
+    } catch (error) {
+      console.log(error);
+      toast.danger("Couldn't load device", { description: "Check your connection and try again." });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, [id]);
+
+  const openEdit = () => {
+    editForm.reset({ name: device.name, slotCount: device.slotCount, status: device.status });
+    editModal.open();
+  };
+
+  const onEditSubmit = async (data) => {
+    try {
+      const res = await fetch(`/api/proxy/devices/${device._id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: data.name,
+          slotCount: Number(data.slotCount),
+          status: data.status,
+        }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        toast.danger("Couldn't update device", { description: result.error || "Please try again." });
+        return;
+      }
+      setDevice(result);
+      toast.success("Device updated");
+      editModal.close();
+    } catch (error) {
+      console.log(error);
+      toast.danger("Couldn't update device", { description: "Something went wrong." });
+    }
+  };
+
+  const confirmDelete = async () => {
+    setIsDeleting(true);
+    try {
+      const res = await fetch(`/api/proxy/devices/${device._id}`, { method: "DELETE" });
+      const result = await res.json();
+      if (!res.ok) {
+        toast.danger("Couldn't delete device", { description: result.error || "Please try again." });
+        return;
+      }
+      toast.success("Device deleted");
+      router.push("/admin/manage-devices");
+    } catch (error) {
+      console.log(error);
+      toast.danger("Couldn't delete device", { description: "Something went wrong." });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  // QR encodes just the raw token — our own in-app scanners attach the
+  // right path themselves before navigating.
+  const qrValueFor = (d) => d.qrToken;
+
+  const handlePrintQr = () => {
+    const container = document.getElementById(`admin-detail-qr-${device._id}`);
+    const svgEl = container?.querySelector("svg");
+    if (!svgEl) return;
+
+    const bigSvg = svgEl.cloneNode(true);
+    bigSvg.setAttribute("width", "320");
+    bigSvg.setAttribute("height", "320");
+
+    const printWindow = window.open("", "_blank", "width=500,height=650");
+    if (!printWindow) {
+      toast.danger("Couldn't open print window", { description: "Check your browser's popup blocker." });
+      return;
+    }
+
+    printWindow.document.write(`
+      <html>
+        <head>
+          <title>${device.name || "Dispo Device"} — QR Code</title>
+          <style>
+            body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; font-family: sans-serif; }
+            h2 { margin: 0 0 24px; font-size: 22px; }
+            p { margin-top: 20px; color: #666; font-size: 13px; }
+          </style>
+        </head>
+        <body>
+          <h2>${device.name || "Dispo Device"}</h2>
+          ${bigSvg.outerHTML}
+          <p>Scan to shop this machine</p>
+        </body>
+      </html>
+    `);
+    printWindow.document.close();
+    printWindow.onload = () => {
+      printWindow.focus();
+      printWindow.print();
+    };
+    printWindow.onafterprint = () => printWindow.close();
+  };
+
+  if (isLoading) {
+    return (
+      <main className="w-full min-h-screen py-10 px-6">
+        <p className="font-body-md text-body-md text-on-surface-variant text-center">Loading…</p>
+      </main>
+    );
+  }
+
+  if (!device) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center px-6 text-center">
+        <TriangleExclamation className="h-8 w-8 text-error mb-3" />
+        <p className="font-headline-sm text-headline-sm text-on-surface">Device not found</p>
+        <button
+          onClick={() => router.push("/admin/manage-devices")}
+          className="mt-4 rounded-full bg-primary-container px-5 py-2.5 font-label-lg text-label-lg text-on-primary cursor-pointer"
+        >
+          Back to Manage Devices
+        </button>
+      </main>
+    );
+  }
+
+  return (
+    <main className="w-full min-h-screen py-10 px-6">
+      <div className="mx-auto max-w-5xl">
+        <Link
+          href="/admin/manage-devices"
+          className="mb-6 inline-flex items-center gap-1.5 font-label-md text-label-md text-on-surface-variant hover:text-primary-container transition-colors"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to Manage Devices
+        </Link>
+
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* ── Left: device information + actions ──────────────── */}
+          <div className="h-fit rounded-[2rem] bg-surface-container-low p-6 shadow-[12px_12px_28px_rgba(184,196,214,0.65),-12px_-12px_28px_rgba(255,255,255,0.95)]">
+            <div className="mb-5 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-surface shadow-[inset_2px_2px_5px_rgba(184,196,214,0.5)]">
+                  <Server className="h-5 w-5 text-tertiary" />
+                </div>
+                <div className="min-w-0">
+                  <h1 className="font-headline-md text-headline-md text-on-surface truncate">
+                    {device.name || "Not yet claimed"}
+                  </h1>
+                  <p className="font-body-sm text-body-sm text-on-surface-variant">
+                    {DEVICE_TYPE_LABELS[device.deviceType] || "Unknown type"}
+                  </p>
+                </div>
+              </div>
+              {device.ownerId && (
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={openEdit}
+                    aria-label="Edit device"
+                    className="flex h-9 w-9 items-center justify-center rounded-full bg-surface text-tertiary shadow-[3px_3px_8px_rgba(184,196,214,0.5)] transition-colors hover:text-primary-container cursor-pointer"
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deleteModal.open()}
+                    aria-label="Delete device"
+                    className="flex h-9 w-9 items-center justify-center rounded-full bg-surface text-tertiary shadow-[3px_3px_8px_rgba(184,196,214,0.5)] transition-colors hover:text-error cursor-pointer"
+                  >
+                    <TrashBin className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-3 mb-5">
+              <div className="flex items-center justify-between rounded-2xl bg-surface px-4 py-3">
+                <span className="font-label-md text-label-md text-on-surface-variant">Status</span>
+                {device.status ? (
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 font-label-sm text-label-sm ${
+                      device.status === "active"
+                        ? "bg-surface-container text-on-surface-variant"
+                        : "bg-error-container text-on-error-container"
+                    }`}
+                  >
+                    {device.status === "active" ? "Active" : "Inactive"}
+                  </span>
+                ) : (
+                  <span className="font-label-sm text-label-sm text-on-surface-variant">Unclaimed</span>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between rounded-2xl bg-surface px-4 py-3">
+                <span className="font-label-md text-label-md text-on-surface-variant">Slots</span>
+                <span className="font-label-md text-label-md text-on-surface">{device.slotCount ?? "—"}</span>
+              </div>
+
+              <div className="flex items-center justify-between rounded-2xl bg-surface px-4 py-3">
+                <span className="font-label-md text-label-md text-on-surface-variant">Owner</span>
+                <span className="font-label-md text-label-md text-on-surface truncate max-w-[60%]">
+                  {ownerName || "Unclaimed"}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between rounded-2xl bg-surface px-4 py-3">
+                <span className="font-label-md text-label-md text-on-surface-variant">WiFi</span>
+                {device.wifiConfiguredAt ? (
+                  <span className="flex items-center gap-1.5 font-label-sm text-label-sm text-on-surface-variant">
+                    <CircleCheck className="h-3.5 w-3.5 text-primary" />
+                    {device.lastKnownIp}
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 font-label-sm text-label-sm text-on-surface-variant">
+                    <PlugConnection className="h-3.5 w-3.5 text-tertiary" />
+                    Not configured
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between rounded-2xl bg-surface px-4 py-3">
+                <span className="font-label-md text-label-md text-on-surface-variant">Provisioned</span>
+                <span className="font-label-sm text-label-sm text-on-surface-variant">
+                  {device.createdAt ? new Date(device.createdAt).toLocaleDateString() : "—"}
+                </span>
+              </div>
+
+              {device.claimedAt && (
+                <div className="flex items-center justify-between rounded-2xl bg-surface px-4 py-3">
+                  <span className="font-label-md text-label-md text-on-surface-variant">Claimed</span>
+                  <span className="font-label-sm text-label-sm text-on-surface-variant">
+                    {new Date(device.claimedAt).toLocaleDateString()}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* QR code + actions */}
+            <div className="flex flex-col items-center rounded-2xl bg-surface p-5">
+              <div
+                className="rounded-xl bg-white p-3 shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)] mb-4"
+                id={`admin-detail-qr-${device._id}`}
+              >
+                <QRCodeSVG value={qrValueFor(device)} size={128} level="M" marginSize={0} />
+              </div>
+              <div className="flex w-full items-center gap-2">
+                {device.ownerId && (
+                  <Link
+                    href={`/owner/devices/${device._id}/wifi`}
+                    className="flex flex-1 items-center justify-center gap-2 rounded-full bg-surface-container-low px-4 py-2 font-label-md text-label-md text-on-surface-variant shadow-[3px_3px_8px_rgba(184,196,214,0.5)] hover:text-primary-container transition-colors"
+                  >
+                    <PlugConnection className="h-4 w-4" />
+                    WiFi setup
+                  </Link>
+                )}
+                <button
+                  type="button"
+                  onClick={handlePrintQr}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-container-low text-on-surface-variant shadow-[3px_3px_8px_rgba(184,196,214,0.5)] hover:text-primary-container transition-colors cursor-pointer"
+                >
+                  <Printer className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Right: products in this device ─────────────────── */}
+          <div>
+            {device.ownerId && (
+              <form
+                onSubmit={handleProductSubmit(onAddProduct)}
+                className="mb-6 flex flex-col gap-3 rounded-[1.5rem] bg-surface-container-low p-5 shadow-[8px_8px_20px_rgba(184,196,214,0.55),-8px_-8px_20px_rgba(255,255,255,0.9)]"
+              >
+                <h2 className="font-headline-sm text-headline-sm text-on-surface">Add a product</h2>
+
+                <div className="flex items-center gap-3">
+                  <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-surface shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)]">
+                    {addImagePreview ? (
+                      <img src={addImagePreview} alt="Preview" className="h-full w-full object-cover" />
+                    ) : (
+                      <Picture className="h-5 w-5 text-tertiary" />
+                    )}
+                  </div>
+                  <label className="flex-1 cursor-pointer rounded-full bg-surface px-4 py-2.5 text-center font-label-md text-label-md text-on-surface-variant hover:bg-surface-container-high transition-colors">
+                    {addImagePreview ? "Change photo" : "Upload photo (optional)"}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) => handleImageFile(e.target.files?.[0])}
+                    />
+                  </label>
+                </div>
+
+                <div className="relative flex items-center rounded-full bg-surface px-4 py-2.5 shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)]">
+                  <Boxes3 className="text-tertiary w-4 h-4 mr-2.5 shrink-0" />
+                  <select
+                    className="w-full bg-transparent font-body-sm text-body-sm text-on-surface focus:outline-none appearance-none"
+                    defaultValue=""
+                    {...registerProduct("slotNumber", { required: true, valueAsNumber: true })}
+                  >
+                    <option value="" disabled>Select a slot…</option>
+                    {availableSlots.map((n) => (
+                      <option key={n} value={n} disabled={takenSlots.has(n)}>
+                        Slot {n}{takenSlots.has(n) ? " (taken)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="relative flex items-center rounded-full bg-surface px-4 py-2.5 shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)]">
+                  <Tag className="text-tertiary w-4 h-4 mr-2.5 shrink-0" />
+                  <input
+                    type="text"
+                    placeholder="Name"
+                    className="w-full bg-transparent font-body-sm text-body-sm text-on-surface placeholder:text-tertiary focus:outline-none"
+                    {...registerProduct("name", { required: true })}
+                  />
+                </div>
+
+                <textarea
+                  rows={2}
+                  placeholder="Description"
+                  className="w-full resize-none rounded-2xl bg-surface px-4 py-2.5 shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)] font-body-sm text-body-sm text-on-surface placeholder:text-tertiary focus:outline-none"
+                  {...registerProduct("description")}
+                />
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="relative flex items-center rounded-full bg-surface px-4 py-2.5 shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)]">
+                    <TagDollar className="text-tertiary w-4 h-4 mr-2 shrink-0" />
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="Price"
+                      className="w-full bg-transparent font-body-sm text-body-sm text-on-surface placeholder:text-tertiary focus:outline-none"
+                      {...registerProduct("price", { required: true, valueAsNumber: true })}
+                    />
+                  </div>
+                  <div className="relative flex items-center rounded-full bg-surface px-4 py-2.5 shadow-[inset_2px_2px_5px_rgba(184,196,214,0.4)]">
+                    <Boxes3 className="text-tertiary w-4 h-4 mr-2 shrink-0" />
+                    <input
+                      type="number"
+                      placeholder="Stock"
+                      className="w-full bg-transparent font-body-sm text-body-sm text-on-surface placeholder:text-tertiary focus:outline-none"
+                      {...registerProduct("stock", { valueAsNumber: true })}
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isAddingProduct}
+                  className="flex items-center justify-center gap-2 rounded-full bg-primary-container px-5 py-2.5 font-label-md text-label-md text-on-primary disabled:opacity-70 cursor-pointer"
+                >
+                  {isAddingProduct ? <Spinner size="sm" color="current" /> : <ArrowRight className="h-4 w-4" />}
+                  {isAddingProduct ? "Adding..." : "Add product"}
+                </button>
+              </form>
+            )}
+
+            <h2 className="font-headline-sm text-headline-sm text-on-surface mb-4">
+              Products ({products.length})
+            </h2>
+            {products.length === 0 ? (
+              <div className="flex flex-col items-center justify-center rounded-[2rem] bg-surface-container-low py-16 px-6 text-center shadow-[inset_3px_3px_8px_rgba(184,196,214,0.4)]">
+                <Box className="h-8 w-8 text-tertiary mb-3" />
+                <p className="font-headline-sm text-headline-sm text-on-surface">No products yet</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+                {products.map((product) => (
+                  <div
+                    key={product._id}
+                    className="rounded-2xl bg-surface-container-low p-3 shadow-[6px_6px_16px_rgba(184,196,214,0.5),-6px_-6px_16px_rgba(255,255,255,0.9)]"
+                  >
+                    <div className="mb-2 flex aspect-square w-full items-center justify-center overflow-hidden rounded-xl bg-surface">
+                      {product.image ? (
+                        <img src={product.image} alt={product.name} className="h-full w-full object-cover" />
+                      ) : (
+                        <Box className="h-6 w-6 text-tertiary" />
+                      )}
+                    </div>
+                    <p className="font-label-md text-label-md text-on-surface truncate">{product.name}</p>
+                    <div className="flex items-center justify-between mt-1">
+                      <span className="font-body-sm text-body-sm text-on-surface-variant">
+                        Slot {product.slotNumber}
+                      </span>
+                      <span className="font-label-sm text-label-sm text-primary">৳{product.price}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Delete confirmation */}
+      <Modal state={deleteModal}>
+        <Modal.Trigger className="hidden" aria-hidden="true" tabIndex={-1} />
+        <Modal.Backdrop>
+          <Modal.Container size="sm" placement="center">
+            <Modal.Dialog>
+              <Modal.Header>
+                <Modal.Icon>
+                  <TriangleExclamation className="h-5 w-5 text-error" />
+                </Modal.Icon>
+                <Modal.Heading>Delete this device?</Modal.Heading>
+              </Modal.Header>
+              <Modal.Body>
+                <p className="font-body-md text-body-md text-on-surface-variant">
+                  "{device.name}" and its QR code will stop working. Any products still assigned
+                  to it must be moved or deleted first.
+                </p>
+              </Modal.Body>
+              <Modal.Footer>
+                <button
+                  type="button"
+                  onClick={() => deleteModal.close()}
+                  disabled={isDeleting}
+                  className="rounded-full px-5 py-2.5 font-label-lg text-label-lg text-on-surface-variant hover:bg-surface-container transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmDelete}
+                  disabled={isDeleting}
+                  className="flex items-center gap-2 rounded-full bg-error px-5 py-2.5 font-label-lg text-label-lg text-on-error transition-opacity hover:opacity-90 cursor-pointer disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isDeleting && <Spinner size="sm" color="current" />}
+                  {isDeleting ? "Deleting..." : "Delete"}
+                </button>
+              </Modal.Footer>
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal>
+
+      {/* Edit device modal */}
+      <Modal state={editModal}>
+        <Modal.Trigger className="hidden" aria-hidden="true" tabIndex={-1} />
+        <Modal.Backdrop>
+          <Modal.Container size="sm" placement="center">
+            <Modal.Dialog>
+              <Modal.Header>
+                <Modal.Heading>Edit device</Modal.Heading>
+              </Modal.Header>
+              <form onSubmit={editForm.handleSubmit(onEditSubmit)}>
+                <Modal.Body>
+                  <div className="flex flex-col gap-4">
+                    <div className="space-y-1.5">
+                      <label className="block font-label-md text-label-md text-on-surface font-semibold">
+                        Name
+                      </label>
+                      <input
+                        type="text"
+                        className="w-full rounded-full bg-surface-container px-4 py-3 font-body-md text-body-md text-on-surface focus:outline-none"
+                        {...editForm.register("name", { required: true })}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="block font-label-md text-label-md text-on-surface font-semibold">
+                        Number of slots
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        className="w-full rounded-full bg-surface-container px-4 py-3 font-body-md text-body-md text-on-surface focus:outline-none"
+                        {...editForm.register("slotCount", { required: true, valueAsNumber: true, min: 1 })}
+                      />
+                      <p className="font-body-sm text-body-sm text-on-surface-variant px-1">
+                        Can't go below whatever slot number the highest product is using.
+                      </p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="block font-label-md text-label-md text-on-surface font-semibold">
+                        Status
+                      </label>
+                      <select
+                        className="w-full rounded-full bg-surface-container px-4 py-3 font-body-md text-body-md text-on-surface focus:outline-none appearance-none"
+                        {...editForm.register("status")}
+                      >
+                        <option value="active">Active</option>
+                        <option value="inactive">Inactive</option>
+                      </select>
+                    </div>
+                  </div>
+                </Modal.Body>
+                <Modal.Footer>
+                  <button
+                    type="button"
+                    onClick={() => editModal.close()}
+                    className="rounded-full px-5 py-2.5 font-label-lg text-label-lg text-on-surface-variant hover:bg-surface-container transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={editForm.formState.isSubmitting}
+                    className="flex items-center gap-2 rounded-full bg-primary-container px-5 py-2.5 font-label-lg text-label-lg text-on-primary transition-opacity hover:opacity-90 cursor-pointer disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    {editForm.formState.isSubmitting && <Spinner size="sm" color="current" />}
+                    {editForm.formState.isSubmitting ? "Saving..." : "Save"}
+                  </button>
+                </Modal.Footer>
+              </form>
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal>
+    </main>
+  );
+}
