@@ -29,6 +29,17 @@ export async function connectToBoard({ onNotify, onDisconnect } = {}) {
     // permission on Android 12+.
     await BleClient.initialize({ androidNeverForLocation: true });
 
+    // Android can prompt the user to turn Bluetooth on with a native
+    // system dialog, so they don't have to leave the app first. iOS
+    // deliberately has no equivalent — Apple never lets apps
+    // programmatically enable Bluetooth, only the user can.
+    if (Capacitor.getPlatform() === "android") {
+      const enabled = await BleClient.isEnabled();
+      if (!enabled) {
+        await BleClient.requestEnable();
+      }
+    }
+
     const device = await BleClient.requestDevice({
       services: [SERVICE_UUID],
     });
