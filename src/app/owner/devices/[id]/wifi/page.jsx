@@ -6,13 +6,7 @@ import Link from "next/link";
 import { useForm } from "react-hook-form";
 import { PlugConnection, Signal, Lock, ArrowRight, ArrowLeft, CircleCheck, TriangleExclamation } from "@gravity-ui/icons";
 import { toast, Spinner } from "@heroui/react";
-
-// Real hardware UUIDs — the same Nordic UART Service pattern proven against
-// actual ESP32 firmware. Every kiosk running the same firmware shares these;
-// only the physical board's advertised name differs.
-const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
-const NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
+import { connectToBoard, isBluetoothSupported } from "@/lib/ble";
 
 export default function DeviceWifiSetupPage() {
   const { id } = useParams();
@@ -22,7 +16,10 @@ export default function DeviceWifiSetupPage() {
   const [isConnected, setIsConnected] = useState(false);
   const [status, setStatus] = useState(null); // { tone: "wait" | "ok" | "fault", text }
 
-  const charRef = useRef(null);
+  // Holds the platform-agnostic { write, disconnect } handle from
+  // connectToBoard() — same shape whether we're using real native
+  // Bluetooth (inside the wrapped app) or Web Bluetooth (plain browser).
+  const boardRef = useRef(null);
 
   const {
     register,
@@ -31,7 +28,7 @@ export default function DeviceWifiSetupPage() {
   } = useForm({ defaultValues: { ssid: "", password: "" } });
 
   useEffect(() => {
-    setIsSupported(typeof navigator !== "undefined" && !!navigator.bluetooth);
+    setIsSupported(isBluetoothSupported());
   }, []);
 
   useEffect(() => {
@@ -57,8 +54,7 @@ export default function DeviceWifiSetupPage() {
     }
   };
 
-  const handleNotify = (event) => {
-    const text = new TextDecoder().decode(event.target.value);
+  const handleNotify = (text) => {
     if (text === "CONNECTING") {
       setStatus({ tone: "wait", text: "Connecting to WiFi…" });
     } else if (text.startsWith("CONNECTED,")) {
@@ -73,26 +69,15 @@ export default function DeviceWifiSetupPage() {
   const handleConnect = async () => {
     setIsConnecting(true);
     try {
-      const btDevice = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [SERVICE_UUID] }],
-        optionalServices: [SERVICE_UUID],
+      const board = await connectToBoard({
+        onNotify: handleNotify,
+        onDisconnect: () => {
+          setIsConnected(false);
+          boardRef.current = null;
+          setStatus({ tone: "fault", text: "Bluetooth connection lost" });
+        },
       });
-
-      btDevice.addEventListener("gattserverdisconnected", () => {
-        setIsConnected(false);
-        charRef.current = null;
-        setStatus({ tone: "fault", text: "Bluetooth connection lost" });
-      });
-
-      const server = await btDevice.gatt.connect();
-      const service = await server.getPrimaryService(SERVICE_UUID);
-      const writeChar = await service.getCharacteristic(CHARACTERISTIC_UUID);
-      const notifyChar = await service.getCharacteristic(NOTIFY_UUID);
-
-      await notifyChar.startNotifications();
-      notifyChar.addEventListener("characteristicvaluechanged", handleNotify);
-
-      charRef.current = writeChar;
+      boardRef.current = board;
       setIsConnected(true);
       toast.success("Connected to board", { description: "Now enter the WiFi details below." });
     } catch (error) {
@@ -106,7 +91,7 @@ export default function DeviceWifiSetupPage() {
   };
 
   const onSubmit = async (data) => {
-    if (!charRef.current) {
+    if (!boardRef.current) {
       toast.danger("Not connected", { description: "Connect to the board first." });
       return;
     }
@@ -118,8 +103,7 @@ export default function DeviceWifiSetupPage() {
     }
     try {
       const command = `${data.ssid},${data.password}\n`;
-      const bytes = new TextEncoder().encode(command);
-      await charRef.current.writeValueWithoutResponse(bytes);
+      await boardRef.current.write(command);
       setStatus({ tone: "wait", text: "Sent — waiting for the board to respond…" });
     } catch (error) {
       console.log(error);
@@ -138,7 +122,8 @@ export default function DeviceWifiSetupPage() {
             This browser can't do Bluetooth setup
           </p>
           <p className="font-body-md text-body-md text-on-surface-variant mt-1 max-w-sm">
-            Open this page in Chrome or Edge on Android, Windows, macOS, or Linux.
+            Open this page in Chrome or Edge on Android, Windows, macOS, or Linux — or use the
+            Dispo app, which has real Bluetooth support on every platform.
           </p>
         </div>
       </main>
