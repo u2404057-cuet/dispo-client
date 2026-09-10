@@ -63,7 +63,11 @@ export default function OnboardingPage() {
         toast.danger("Couldn't save your profile", { description: error.message || "Please try again." });
         return;
       }
-      router.push("/");
+      // A full page navigation (not router.push) forces proxy.js to
+      // re-evaluate the session fresh from the server — router.push can
+      // otherwise show a stale client-side cache of the "needs onboarding"
+      // redirect from just before this phone number was saved.
+      window.location.href = "/";
     } catch (error) {
       console.log(error);
       toast.danger("Couldn't save your profile", { description: "Something went wrong." });
