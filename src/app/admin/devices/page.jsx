@@ -10,14 +10,10 @@ import {
   PlugConnection,
   TriangleExclamation,
   ArrowRight,
+  TrashBin,
 } from "@gravity-ui/icons";
-import { toast, Spinner } from "@heroui/react";
-
-// Same Nordic UART Service UUIDs already proven for the WiFi-setup BLE
-// feature — every board running the same firmware shares these.
-const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
-const NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
+import { Modal, toast, Spinner, useOverlayState } from "@heroui/react";
+import { connectToBoard, isBluetoothSupported } from "@/lib/ble";
 
 const DEVICE_TYPES = [
   { value: "coffee_machine", label: "Coffee Machine" },
@@ -54,7 +50,11 @@ export default function AdminDevicesPage() {
   const [isConnected, setIsConnected] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [status, setStatus] = useState(null); // { tone, text }
-  const charRef = useRef(null);
+  const boardRef = useRef(null); // { write, disconnect } handle from connectToBoard()
+
+  const deleteModal = useOverlayState();
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const ownerNameById = useMemo(
     () => Object.fromEntries(users.map((u) => [u._id, u.name || u.email])),
@@ -80,7 +80,7 @@ export default function AdminDevicesPage() {
 
   useEffect(() => {
     load();
-    setIsSupported(typeof navigator !== "undefined" && !!navigator.bluetooth);
+    setIsSupported(isBluetoothSupported());
   }, []);
 
   const resetWizard = () => {
@@ -91,7 +91,7 @@ export default function AdminDevicesPage() {
     setPendingDevice(null);
     setIsConnected(false);
     setStatus(null);
-    charRef.current = null;
+    boardRef.current = null;
   };
 
   const submitProvisionForm = async (e) => {
@@ -149,7 +149,7 @@ export default function AdminDevicesPage() {
     setWizardStep("ble");
     setIsConnected(false);
     setStatus(null);
-    charRef.current = null;
+    boardRef.current = null;
   };
 
   // NOTE: this "dvi_<token>" command and the DEVICEID_SET/DEVICEID_FAILED
@@ -157,8 +157,7 @@ export default function AdminDevicesPage() {
   // firmware — unlike the WiFi-setup BLE flow, which was tested on actual
   // hardware. Worth confirming the exact wire format once ESP firmware for
   // this specific command exists.
-  const handleNotify = (event) => {
-    const text = new TextDecoder().decode(event.target.value);
+  const handleNotify = (text) => {
     if (text === "SETTING") {
       setStatus({ tone: "wait", text: "Setting device ID…" });
     } else if (text === "DEVICEID_SET") {
@@ -172,26 +171,15 @@ export default function AdminDevicesPage() {
   const handleConnect = async () => {
     setIsConnecting(true);
     try {
-      const btDevice = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [SERVICE_UUID] }],
-        optionalServices: [SERVICE_UUID],
+      const board = await connectToBoard({
+        onNotify: handleNotify,
+        onDisconnect: () => {
+          setIsConnected(false);
+          boardRef.current = null;
+          setStatus({ tone: "fault", text: "Bluetooth connection lost" });
+        },
       });
-
-      btDevice.addEventListener("gattserverdisconnected", () => {
-        setIsConnected(false);
-        charRef.current = null;
-        setStatus({ tone: "fault", text: "Bluetooth connection lost" });
-      });
-
-      const server = await btDevice.gatt.connect();
-      const service = await server.getPrimaryService(SERVICE_UUID);
-      const writeChar = await service.getCharacteristic(CHARACTERISTIC_UUID);
-      const notifyChar = await service.getCharacteristic(NOTIFY_UUID);
-
-      await notifyChar.startNotifications();
-      notifyChar.addEventListener("characteristicvaluechanged", handleNotify);
-
-      charRef.current = writeChar;
+      boardRef.current = board;
       setIsConnected(true);
       toast.success("Connected to board");
     } catch (error) {
@@ -205,12 +193,11 @@ export default function AdminDevicesPage() {
   };
 
   const sendDeviceId = async () => {
-    if (!charRef.current || !pendingDevice) return;
+    if (!boardRef.current || !pendingDevice) return;
     setIsSending(true);
     try {
       const command = `dvi_${pendingDevice.qrToken}\n`;
-      const bytes = new TextEncoder().encode(command);
-      await charRef.current.writeValueWithoutResponse(bytes);
+      await boardRef.current.write(command);
       setStatus({ tone: "wait", text: "Sent — waiting for the board to confirm…" });
     } catch (error) {
       console.log(error);
@@ -231,6 +218,36 @@ export default function AdminDevicesPage() {
       );
     } catch (error) {
       console.log(error);
+    }
+  };
+
+  // Admin can delete any device, claimed or not — e.g. cleaning up a
+  // mis-provisioned stub that never got confirmed, or removing an
+  // owner's device on request.
+  const askDelete = (device) => {
+    setDeleteTarget(device);
+    deleteModal.open();
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setIsDeleting(true);
+    try {
+      const res = await fetch(`/api/proxy/devices/${deleteTarget._id}`, { method: "DELETE" });
+      const result = await res.json();
+      if (!res.ok) {
+        toast.danger("Couldn't delete device", { description: result.error || "Please try again." });
+        return;
+      }
+      setDevices((prev) => prev.filter((d) => d._id !== deleteTarget._id));
+      toast.success("Device deleted");
+      deleteModal.close();
+      setDeleteTarget(null);
+    } catch (error) {
+      console.log(error);
+      toast.danger("Couldn't delete device", { description: "Something went wrong." });
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -463,8 +480,17 @@ export default function AdminDevicesPage() {
             devices.map((device) => (
               <div
                 key={device._id}
-                className="flex flex-col items-center rounded-[1.5rem] bg-surface-container-low p-5 shadow-[8px_8px_20px_rgba(184,196,214,0.55),-8px_-8px_20px_rgba(255,255,255,0.9)]"
+                className="relative flex flex-col items-center rounded-[1.5rem] bg-surface-container-low p-5 shadow-[8px_8px_20px_rgba(184,196,214,0.55),-8px_-8px_20px_rgba(255,255,255,0.9)]"
               >
+                <button
+                  type="button"
+                  onClick={() => askDelete(device)}
+                  aria-label="Delete device"
+                  className="absolute top-3 right-3 flex h-8 w-8 items-center justify-center rounded-full bg-surface text-tertiary shadow-[3px_3px_8px_rgba(184,196,214,0.5)] transition-colors hover:text-error cursor-pointer"
+                >
+                  <TrashBin className="h-3.5 w-3.5" />
+                </button>
+
                 <div className="mb-3 w-full text-center">
                   {device.ownerId ? (
                     <>
@@ -538,6 +564,49 @@ export default function AdminDevicesPage() {
           )}
         </div>
       </div>
+
+      {/* Delete confirmation — admin can remove any device, claimed or not */}
+      <Modal state={deleteModal}>
+        <Modal.Trigger className="hidden" aria-hidden="true" tabIndex={-1} />
+        <Modal.Backdrop>
+          <Modal.Container size="sm" placement="center">
+            <Modal.Dialog>
+              <Modal.Header>
+                <Modal.Icon>
+                  <TriangleExclamation className="h-5 w-5 text-error" />
+                </Modal.Icon>
+                <Modal.Heading>Delete this device?</Modal.Heading>
+              </Modal.Header>
+              <Modal.Body>
+                <p className="font-body-md text-body-md text-on-surface-variant">
+                  {deleteTarget?.ownerId
+                    ? `"${deleteTarget.name}" and its QR code will stop working. Any products still assigned to it must be moved or deleted first.`
+                    : "This device hasn't been claimed by anyone yet. Deleting it permanently invalidates its QR code — anyone holding the physical sticker will no longer be able to claim it."}
+                </p>
+              </Modal.Body>
+              <Modal.Footer>
+                <button
+                  type="button"
+                  onClick={() => deleteModal.close()}
+                  disabled={isDeleting}
+                  className="rounded-full px-5 py-2.5 font-label-lg text-label-lg text-on-surface-variant hover:bg-surface-container transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmDelete}
+                  disabled={isDeleting}
+                  className="flex items-center gap-2 rounded-full bg-error px-5 py-2.5 font-label-lg text-label-lg text-on-error transition-opacity hover:opacity-90 cursor-pointer disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isDeleting && <Spinner size="sm" color="current" />}
+                  {isDeleting ? "Deleting..." : "Delete"}
+                </button>
+              </Modal.Footer>
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal>
     </main>
   );
 }

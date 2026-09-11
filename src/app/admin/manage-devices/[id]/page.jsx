@@ -273,8 +273,8 @@ export default function ManageDeviceDetailPage() {
                   </p>
                 </div>
               </div>
-              {device.ownerId && (
-                <div className="flex shrink-0 items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
+                {device.ownerId && (
                   <button
                     type="button"
                     onClick={openEdit}
@@ -283,16 +283,16 @@ export default function ManageDeviceDetailPage() {
                   >
                     <Pencil className="h-4 w-4" />
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => deleteModal.open()}
-                    aria-label="Delete device"
-                    className="flex h-9 w-9 items-center justify-center rounded-full bg-surface text-tertiary shadow-[3px_3px_8px_rgba(184,196,214,0.5)] transition-colors hover:text-error cursor-pointer"
-                  >
-                    <TrashBin className="h-4 w-4" />
-                  </button>
-                </div>
-              )}
+                )}
+                <button
+                  type="button"
+                  onClick={() => deleteModal.open()}
+                  aria-label="Delete device"
+                  className="flex h-9 w-9 items-center justify-center rounded-full bg-surface text-tertiary shadow-[3px_3px_8px_rgba(184,196,214,0.5)] transition-colors hover:text-error cursor-pointer"
+                >
+                  <TrashBin className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             <div className="flex flex-col gap-3 mb-5">
@@ -531,8 +531,9 @@ export default function ManageDeviceDetailPage() {
               </Modal.Header>
               <Modal.Body>
                 <p className="font-body-md text-body-md text-on-surface-variant">
-                  "{device.name}" and its QR code will stop working. Any products still assigned
-                  to it must be moved or deleted first.
+                  {device.ownerId
+                    ? `"${device.name}" and its QR code will stop working. Any products still assigned to it must be moved or deleted first.`
+                    : "This device hasn't been claimed by anyone yet. Deleting it permanently invalidates its QR code — anyone holding the physical sticker will no longer be able to claim it."}
                 </p>
               </Modal.Body>
               <Modal.Footer>

@@ -13,13 +13,7 @@ import {
   PlugConnection,
 } from "@gravity-ui/icons";
 import { toast, Spinner } from "@heroui/react";
-
-// Same Nordic UART Service UUIDs proven against real ESP32 firmware for
-// WiFi setup — reused here since claiming a device now folds that same
-// step into the claim flow itself.
-const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
-const NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
+import { connectToBoard, isBluetoothSupported } from "@/lib/ble";
 
 export default function ClaimDevicePage() {
   const { token } = useParams();
@@ -35,7 +29,7 @@ export default function ClaimDevicePage() {
   const [isConnected, setIsConnected] = useState(false);
   const [wifiIp, setWifiIp] = useState(null);
   const [status, setStatus] = useState(null); // { tone, text }
-  const charRef = useRef(null);
+  const boardRef = useRef(null); // { write, disconnect } handle from connectToBoard()
 
   const {
     register,
@@ -50,7 +44,7 @@ export default function ClaimDevicePage() {
   } = useForm({ defaultValues: { ssid: "", password: "" } });
 
   useEffect(() => {
-    setIsSupported(typeof navigator !== "undefined" && !!navigator.bluetooth);
+    setIsSupported(isBluetoothSupported());
   }, []);
 
   useEffect(() => {
@@ -72,8 +66,7 @@ export default function ClaimDevicePage() {
       .finally(() => setIsLoading(false));
   }, [token]);
 
-  const handleNotify = (event) => {
-    const text = new TextDecoder().decode(event.target.value);
+  const handleNotify = (text) => {
     if (text === "CONNECTING") {
       setStatus({ tone: "wait", text: "Connecting to WiFi…" });
     } else if (text.startsWith("CONNECTED,")) {
@@ -88,26 +81,15 @@ export default function ClaimDevicePage() {
   const handleConnect = async () => {
     setIsConnecting(true);
     try {
-      const btDevice = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [SERVICE_UUID] }],
-        optionalServices: [SERVICE_UUID],
+      const board = await connectToBoard({
+        onNotify: handleNotify,
+        onDisconnect: () => {
+          setIsConnected(false);
+          boardRef.current = null;
+          setStatus({ tone: "fault", text: "Bluetooth connection lost" });
+        },
       });
-
-      btDevice.addEventListener("gattserverdisconnected", () => {
-        setIsConnected(false);
-        charRef.current = null;
-        setStatus({ tone: "fault", text: "Bluetooth connection lost" });
-      });
-
-      const server = await btDevice.gatt.connect();
-      const service = await server.getPrimaryService(SERVICE_UUID);
-      const writeChar = await service.getCharacteristic(CHARACTERISTIC_UUID);
-      const notifyChar = await service.getCharacteristic(NOTIFY_UUID);
-
-      await notifyChar.startNotifications();
-      notifyChar.addEventListener("characteristicvaluechanged", handleNotify);
-
-      charRef.current = writeChar;
+      boardRef.current = board;
       setIsConnected(true);
       toast.success("Connected to board", { description: "Now enter the WiFi details below." });
     } catch (error) {
@@ -121,7 +103,7 @@ export default function ClaimDevicePage() {
   };
 
   const onWifiSubmit = async (data) => {
-    if (!charRef.current) {
+    if (!boardRef.current) {
       toast.danger("Not connected", { description: "Connect to the board first." });
       return;
     }
@@ -133,8 +115,7 @@ export default function ClaimDevicePage() {
     }
     try {
       const command = `${data.ssid},${data.password}\n`;
-      const bytes = new TextEncoder().encode(command);
-      await charRef.current.writeValueWithoutResponse(bytes);
+      await boardRef.current.write(command);
       setStatus({ tone: "wait", text: "Sent — waiting for the board to respond…" });
     } catch (error) {
       console.log(error);
