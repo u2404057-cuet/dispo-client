@@ -7,7 +7,9 @@ import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { Envelope, Lock, Eye, EyeSlash, ArrowRight } from "@gravity-ui/icons";
 import { toast, Spinner } from "@heroui/react";
+import { Capacitor } from "@capacitor/core";
 import { authClient } from "@/lib/auth-client";
+import { signInWithGoogleNative } from "@/lib/google-native-auth";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -27,6 +29,30 @@ export default function LoginPage() {
   const handleGoogleLogin = async () => {
     setIsGoogleLoading(true);
     try {
+      // In the native app, a normal redirect-based OAuth flow gets handed
+      // off to Chrome (the WebView only navigates within its own origin),
+      // and the session cookie that Google's callback sets ends up in
+      // Chrome's cookie jar, not the app's — so the app never sees it.
+      // Native Google Sign-In gets an ID token without leaving the app,
+      // and we hand that straight to better-auth to set the session
+      // cookie inside the app's own WebView.
+      if (Capacitor.isNativePlatform()) {
+        const idToken = await signInWithGoogleNative();
+        const { error } = await authClient.signIn.social({
+          provider: "google",
+          idToken: { token: idToken },
+        });
+
+        if (error) {
+          toast.danger("Couldn't sign in with Google", { description: error.message || "Please try again." });
+          setIsGoogleLoading(false);
+          return;
+        }
+
+        router.push("/");
+        return;
+      }
+
       await authClient.signIn.social({
         provider: "google",
         callbackURL: "/",

@@ -13,6 +13,18 @@ const config: CapacitorConfig = {
     url: 'https://dispo-client.vercel.app',
     cleartext: false,
   },
+  plugins: {
+    // Only Google is wired up (see src/lib/google-native-auth.js) — the
+    // other providers would otherwise bundle their SDKs for nothing.
+    SocialLogin: {
+      providers: {
+        google: true,
+        facebook: false,
+        apple: false,
+        twitter: false,
+      },
+    },
+  },
 };
 
 export default config;
