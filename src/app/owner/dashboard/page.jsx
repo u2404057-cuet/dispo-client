@@ -57,13 +57,22 @@ export default function OwnerDashboardPage() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [productsRes, devicesRes, ordersRes] = await Promise.all([
-          fetch("/api/proxy/products"),
-          fetch("/api/proxy/devices"),
+        const devicesRes = await fetch("/api/proxy/devices");
+        const devicesData = await devicesRes.json();
+        setDevices(devicesData);
+
+        // Scope the products query to just this owner's own devices (and
+        // drop the base64 `image` field, which dashboards never render) —
+        // fetching the whole system's product photos just to show a few
+        // counts is what made this page slow.
+        const deviceIds = Array.isArray(devicesData) ? devicesData.map((d) => d._id) : [];
+        const [productsRes, ordersRes] = await Promise.all([
+          deviceIds.length > 0
+            ? fetch(`/api/proxy/products?deviceId=${deviceIds.join(",")}&noImages=true`)
+            : Promise.resolve(null),
           fetch("/api/proxy/orders"),
         ]);
-        setProducts(await productsRes.json());
-        setDevices(await devicesRes.json());
+        setProducts(productsRes ? await productsRes.json() : []);
         setOrders(await ordersRes.json());
       } catch (error) {
         console.log(error);
@@ -74,11 +83,8 @@ export default function OwnerDashboardPage() {
     load();
   }, []);
 
-  // GET /api/products is intentionally public/unfiltered (customers browsing
-  // /shop need every owner's products). Every stat/chart below that's based
-  // on products must first be scoped to devices this account actually owns
-  // (or every device, correctly, if this account is admin) — otherwise the
-  // dashboard shows the whole system's numbers, not this owner's business.
+  // Products are already scoped to this owner's devices by the query
+  // above — this just guards against a malformed response shape.
   const myProducts = useMemo(() => {
     if (!Array.isArray(products) || !Array.isArray(devices)) return [];
     const ownedDeviceIds = new Set(devices.map((d) => d._id));

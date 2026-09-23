@@ -61,7 +61,7 @@ export default function AdminDashboardPage() {
         const [usersRes, devicesRes, productsRes, ordersRes] = await Promise.all([
           fetch("/api/proxy/users"),
           fetch("/api/proxy/devices"),
-          fetch("/api/proxy/products"),
+          fetch("/api/proxy/products?noImages=true"),
           fetch("/api/proxy/orders"),
         ]);
         setUsers(await usersRes.json());

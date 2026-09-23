@@ -129,7 +129,12 @@ export default function RegisterPage() {
           return;
         }
 
-        router.push("/");
+        // Full page navigation, not router.push — see the login page's
+        // Google handler for why: a client-side transition right after
+        // signing in can outrace authClient's session cache, so a
+        // first-time Google sign-up landing on /onboarding sees a stale
+        // "not logged in" and bounces to /login instead.
+        window.location.href = "/";
         return;
       }
 
