@@ -52,7 +52,11 @@ export default function AdminClaimDevicePage() {
       .then((res) => res.json())
       .then((data) => {
         if (data.error) {
-          setError(data.error);
+          setError(
+            data.error === "Device not found"
+              ? "Use a valid QR code — this device doesn't exist."
+              : data.error
+          );
         } else if (data.ownerId) {
           setError("This device has already been claimed.");
         } else {

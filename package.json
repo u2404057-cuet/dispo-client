@@ -25,7 +25,8 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-hook-form": "^7.87.0",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "swr": "^2.5.1"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.5.1",

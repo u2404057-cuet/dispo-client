@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
+import useSWR from "swr";
+import { fetcher } from "@/lib/fetcher";
 import { Box, Server, Persons, ChartLine, SealPercent } from "@gravity-ui/icons";
 import {
   BarChart,
@@ -49,33 +51,12 @@ function EmptyChartState({ icon: Icon, message }) {
 }
 
 export default function AdminDashboardPage() {
-  const [users, setUsers] = useState([]);
-  const [devices, setDevices] = useState([]);
-  const [products, setProducts] = useState([]);
-  const [orders, setOrders] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { data: users = [], isLoading: usersLoading } = useSWR("/api/proxy/users", fetcher);
+  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher);
+  const { data: products = [], isLoading: productsLoading } = useSWR("/api/proxy/products?noImages=true", fetcher);
+  const { data: orders = [], isLoading: ordersLoading } = useSWR("/api/proxy/orders", fetcher);
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [usersRes, devicesRes, productsRes, ordersRes] = await Promise.all([
-          fetch("/api/proxy/users"),
-          fetch("/api/proxy/devices"),
-          fetch("/api/proxy/products?noImages=true"),
-          fetch("/api/proxy/orders"),
-        ]);
-        setUsers(await usersRes.json());
-        setDevices(await devicesRes.json());
-        setProducts(await productsRes.json());
-        setOrders(await ordersRes.json());
-      } catch (error) {
-        console.log(error);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, []);
+  const loading = usersLoading || devicesLoading || productsLoading || ordersLoading;
 
   const totalRevenue = useMemo(
     () => (Array.isArray(orders) ? orders.reduce((sum, o) => sum + (o.total || 0), 0) : 0),

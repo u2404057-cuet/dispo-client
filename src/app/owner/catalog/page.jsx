@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
+import useSWR from "swr";
+import { fetcher } from "@/lib/fetcher";
 import { useForm } from "react-hook-form";
 import {
   Box,
@@ -39,10 +41,14 @@ function CatalogPageContent() {
   const searchParams = useSearchParams();
   const preselectedDeviceId = searchParams.get("device");
 
-  const [products, setProducts] = useState([]);
-  const [isLoadingProducts, setIsLoadingProducts] = useState(true);
-  const [devices, setDevices] = useState([]);
-  const [isLoadingDevices, setIsLoadingDevices] = useState(true);
+  const {
+    data: products = [],
+    isLoading: isLoadingProducts,
+    mutate: mutateProducts,
+  } = useSWR("/api/proxy/products", fetcher, {
+    onError: () => toast.danger("Couldn't load your catalog", { description: "Check your connection and try again." }),
+  });
+  const { data: devices = [], isLoading: isLoadingDevices } = useSWR("/api/proxy/devices", fetcher);
   const [deviceFilter, setDeviceFilter] = useState(""); // "" = show every device
 
   const {
@@ -145,29 +151,6 @@ function CatalogPageContent() {
     [myProducts, deviceFilter]
   );
 
-  const fetchAll = async () => {
-    setIsLoadingProducts(true);
-    setIsLoadingDevices(true);
-    try {
-      const [productsRes, devicesRes] = await Promise.all([
-        fetch("/api/proxy/products"),
-        fetch("/api/proxy/devices"),
-      ]);
-      setProducts(await productsRes.json());
-      setDevices(await devicesRes.json());
-    } catch (error) {
-      console.log(error);
-      toast.danger("Couldn't load your catalog", { description: "Check your connection and try again." });
-    } finally {
-      setIsLoadingProducts(false);
-      setIsLoadingDevices(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchAll();
-  }, []);
-
   // A device just claimed via /owner/devices/claim/[token] redirects here
   // with ?device=<id> so the owner can start stocking it immediately,
   // without hunting for it in the dropdown themselves.
@@ -189,7 +172,7 @@ function CatalogPageContent() {
         toast.danger("Couldn't add product", { description: created.error || "Please try again." });
         return;
       }
-      setProducts((prev) => [...prev, created]);
+      mutateProducts((current = []) => [...current, created], { revalidate: false });
       reset();
       setAddImagePreview(null);
       setAddImageBase64(null);
@@ -215,7 +198,7 @@ function CatalogPageContent() {
         toast.danger("Couldn't delete product", { description: result.error || "Please try again." });
         return;
       }
-      setProducts((prev) => prev.filter((p) => p._id !== deleteTarget._id));
+      mutateProducts((current = []) => current.filter((p) => p._id !== deleteTarget._id), { revalidate: false });
       toast.success("Product deleted", { description: `${deleteTarget.name} was removed.` });
       deleteModal.close();
       setDeleteTarget(null);
@@ -254,8 +237,10 @@ function CatalogPageContent() {
         toast.danger("Couldn't update product", { description: result.error || "Please try again." });
         return;
       }
-      setProducts((prev) =>
-        prev.map((p) => (p._id === editingProduct._id ? { ...p, ...data, image: editImageBase64 } : p))
+      mutateProducts(
+        (current = []) =>
+          current.map((p) => (p._id === editingProduct._id ? { ...p, ...data, image: editImageBase64 } : p)),
+        { revalidate: false }
       );
       toast.success("Product updated", { description: `${data.name} was saved.` });
       editModal.close();

@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
+import useSWR from "swr";
+import { fetcher } from "@/lib/fetcher";
 import { Box, Server, TagDollar, ChartLine, SealPercent } from "@gravity-ui/icons";
 import {
   BarChart,
@@ -49,39 +51,20 @@ function EmptyChartState({ icon: Icon, message }) {
 }
 
 export default function OwnerDashboardPage() {
-  const [products, setProducts] = useState([]);
-  const [devices, setDevices] = useState([]);
-  const [orders, setOrders] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher);
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const devicesRes = await fetch("/api/proxy/devices");
-        const devicesData = await devicesRes.json();
-        setDevices(devicesData);
+  // Scope the products query to just this owner's own devices (and drop
+  // the base64 `image` field, which dashboards never render) — fetching
+  // the whole system's product photos just to show a few counts is what
+  // made this page slow. Key is null (no fetch) until devices resolves.
+  const deviceIds = useMemo(() => (Array.isArray(devices) ? devices.map((d) => d._id) : []), [devices]);
+  const productsKey =
+    deviceIds.length > 0 ? `/api/proxy/products?deviceId=${deviceIds.join(",")}&noImages=true` : null;
+  const { data: products = [], isLoading: productsLoading } = useSWR(productsKey, fetcher);
 
-        // Scope the products query to just this owner's own devices (and
-        // drop the base64 `image` field, which dashboards never render) —
-        // fetching the whole system's product photos just to show a few
-        // counts is what made this page slow.
-        const deviceIds = Array.isArray(devicesData) ? devicesData.map((d) => d._id) : [];
-        const [productsRes, ordersRes] = await Promise.all([
-          deviceIds.length > 0
-            ? fetch(`/api/proxy/products?deviceId=${deviceIds.join(",")}&noImages=true`)
-            : Promise.resolve(null),
-          fetch("/api/proxy/orders"),
-        ]);
-        setProducts(productsRes ? await productsRes.json() : []);
-        setOrders(await ordersRes.json());
-      } catch (error) {
-        console.log(error);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, []);
+  const { data: orders = [], isLoading: ordersLoading } = useSWR("/api/proxy/orders", fetcher);
+
+  const loading = devicesLoading || productsLoading || ordersLoading;
 
   // Products are already scoped to this owner's devices by the query
   // above — this just guards against a malformed response shape.

@@ -19,7 +19,11 @@ export default function ScanResolverPage() {
         const res = await fetch(`/api/proxy/devices/by-token/${token}`);
         const data = await res.json();
         if (!res.ok) {
-          setError(data.error || "Device not found");
+          setError(
+            data.error === "Device not found"
+              ? "Use a valid QR code — this device doesn't exist."
+              : data.error || "Device not found"
+          );
           return;
         }
 

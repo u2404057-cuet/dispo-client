@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState, Suspense } from "react";
+import { useMemo, useState, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
+import useSWR from "swr";
+import { fetcher } from "@/lib/fetcher";
 import { Box, Magnifier, ShoppingCart, Server, ArrowLeft } from "@gravity-ui/icons";
 import { toast } from "@heroui/react";
 import { useCart } from "@/lib/cart-context";
@@ -29,39 +31,22 @@ function BrowsePageContent() {
   const router = useRouter();
   const deviceId = searchParams.get("device");
 
-  const [products, setProducts] = useState([]);
-  const [deviceName, setDeviceName] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
   const [query, setQuery] = useState("");
 
   const { addItem } = useCart();
 
-  useEffect(() => {
-    const fetchData = async () => {
-      setIsLoading(true);
-      try {
-        const productsUrl = deviceId ? `/api/proxy/products?deviceId=${deviceId}` : "/api/proxy/products";
-        const res = await fetch(productsUrl);
-        const data = await res.json();
-        setProducts(Array.isArray(data) ? data : []);
+  const productsUrl = deviceId ? `/api/proxy/products?deviceId=${deviceId}` : "/api/proxy/products";
+  const { data: productsData, isLoading } = useSWR(productsUrl, fetcher, {
+    onError: () => toast.danger("Couldn't load the catalog", { description: "Check your connection and try again." }),
+  });
+  const products = useMemo(() => (Array.isArray(productsData) ? productsData : []), [productsData]);
 
-        if (deviceId) {
-          const deviceRes = await fetch("/api/proxy/devices/public");
-          const devices = await deviceRes.json();
-          const match = Array.isArray(devices) ? devices.find((d) => d._id === deviceId) : null;
-          setDeviceName(match ? match.name : null);
-        } else {
-          setDeviceName(null);
-        }
-      } catch (error) {
-        console.log(error);
-        toast.danger("Couldn't load the catalog", { description: "Check your connection and try again." });
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    fetchData();
-  }, [deviceId]);
+  const { data: publicDevices } = useSWR(deviceId ? "/api/proxy/devices/public" : null, fetcher);
+  const deviceName = useMemo(() => {
+    if (!deviceId || !Array.isArray(publicDevices)) return null;
+    const match = publicDevices.find((d) => d._id === deviceId);
+    return match ? match.name : null;
+  }, [deviceId, publicDevices]);
 
   const filteredProducts = useMemo(() => {
     if (!query.trim()) return products;
