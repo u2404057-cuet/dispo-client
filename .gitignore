@@ -38,4 +38,9 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# built Android artifacts shared for testing (not source)
+*.apk
+*.aab
+*.apk.zip
 next-env.d.ts
