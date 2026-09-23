@@ -19,9 +19,10 @@ function initialize() {
 // browser.
 export async function signInWithGoogleNative() {
   await initialize();
-  const { result } = await SocialLogin.login({
-    provider: "google",
-    options: { scopes: ["email", "profile"] },
-  });
+  // No `scopes` here on purpose: the plugin already requests
+  // email/profile/openid by default, and passing scopes explicitly
+  // switches it to Google's Authorization API, which requires extra
+  // MainActivity wiring we don't need for a plain sign-in.
+  const { result } = await SocialLogin.login({ provider: "google" });
   return result.idToken;
 }
