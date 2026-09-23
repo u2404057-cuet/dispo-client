@@ -7,7 +7,9 @@ import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { Person, At, Lock, Eye, EyeSlash, ArrowRight } from "@gravity-ui/icons";
 import { toast, Spinner } from "@heroui/react";
+import { Capacitor } from "@capacitor/core";
 import { authClient } from "@/lib/auth-client";
+import { signInWithGoogleNative } from "@/lib/google-native-auth";
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -109,13 +111,35 @@ export default function RegisterPage() {
   const handleGoogleSignUp = async () => {
     setIsGoogleLoading(true);
     try {
+      // Same reasoning as the login page: a browser-redirect OAuth flow
+      // escapes the app's WebView into Chrome and the session cookie it
+      // sets never makes it back, so native platforms use Google's
+      // native Credential Manager instead and hand the ID token straight
+      // to better-auth.
+      if (Capacitor.isNativePlatform()) {
+        const idToken = await signInWithGoogleNative();
+        const { error } = await authClient.signIn.social({
+          provider: "google",
+          idToken: { token: idToken },
+        });
+
+        if (error) {
+          toast.danger("Couldn't sign up with Google", { description: error.message || "Please try again." });
+          setIsGoogleLoading(false);
+          return;
+        }
+
+        router.push("/");
+        return;
+      }
+
       await authClient.signIn.social({
         provider: "google",
         callbackURL: "/",
       });
     } catch (error) {
       console.log(error);
-      toast.danger("Couldn't sign up with Google", { description: "Please try again." });
+      toast.danger("Couldn't sign up with Google", { description: error?.message || error?.errorMessage || "Please try again." });
       setIsGoogleLoading(false);
     }
   };

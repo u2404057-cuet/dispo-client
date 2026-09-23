@@ -59,7 +59,7 @@ export default function LoginPage() {
       });
     } catch (error) {
       console.log(error);
-      toast.danger("Couldn't sign in with Google", { description: "Please try again." });
+      toast.danger("Couldn't sign in with Google", { description: error?.message || error?.errorMessage || "Please try again." });
       setIsGoogleLoading(false);
     }
   };
