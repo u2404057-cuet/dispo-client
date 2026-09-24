@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { Receipt, Server, CircleCheck, Hourglass } from "@gravity-ui/icons";
+import { useMemo, useState } from "react";
+import useSWR from "swr";
+import { fetcher } from "@/lib/fetcher";
+import { Receipt, Server, CircleCheck, Hourglass, TriangleExclamation } from "@gravity-ui/icons";
 import { toast, Spinner } from "@heroui/react";
 
 function OrderRowSkeleton() {
@@ -14,36 +16,17 @@ function OrderRowSkeleton() {
 }
 
 export default function OwnerOrdersPage() {
-  const [orders, setOrders] = useState([]);
-  const [devices, setDevices] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const { data: orders = [], isLoading: ordersLoading, mutate: mutateOrders } = useSWR("/api/proxy/orders", fetcher, {
+    refreshInterval: 10000, // new orders and status changes arrive within 10s
+  });
+  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher);
+  const isLoading = ordersLoading || devicesLoading;
   const [completingId, setCompletingId] = useState(null);
 
   const deviceNameById = useMemo(
-    () => Object.fromEntries(devices.map((d) => [d._id, d.name])),
+    () => Object.fromEntries((Array.isArray(devices) ? devices : []).map((d) => [d._id, d.name])),
     [devices]
   );
-
-  const load = async () => {
-    setIsLoading(true);
-    try {
-      const [ordersRes, devicesRes] = await Promise.all([
-        fetch("/api/proxy/orders"),
-        fetch("/api/proxy/devices"),
-      ]);
-      setOrders(await ordersRes.json());
-      setDevices(await devicesRes.json());
-    } catch (error) {
-      console.log(error);
-      toast.danger("Couldn't load orders", { description: "Check your connection and try again." });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    load();
-  }, []);
 
   const markComplete = async (order) => {
     setCompletingId(order._id);
@@ -54,8 +37,9 @@ export default function OwnerOrdersPage() {
         toast.danger("Couldn't complete order", { description: result.error || "Please try again." });
         return;
       }
-      setOrders((prev) =>
-        prev.map((o) => (o._id === order._id ? { ...o, status: "completed" } : o))
+      mutateOrders(
+        (prev) => (prev || []).map((o) => (o._id === order._id ? { ...o, status: "completed" } : o)),
+        { revalidate: false }
       );
       toast.success("Order marked as dispensed");
     } catch (error) {
@@ -109,6 +93,16 @@ export default function OwnerOrdersPage() {
                       <span className="flex items-center gap-1 rounded-full bg-primary-fixed px-2.5 py-0.5 font-label-sm text-label-sm text-on-primary-fixed-variant">
                         <CircleCheck className="h-3 w-3" />
                         Completed
+                      </span>
+                    ) : order.status === "dispensing" ? (
+                      <span className="flex items-center gap-1 rounded-full bg-primary-container px-2.5 py-0.5 font-label-sm text-label-sm text-on-primary">
+                        <Spinner size="sm" color="current" />
+                        Dispensing
+                      </span>
+                    ) : order.status === "failed" ? (
+                      <span className="flex items-center gap-1 rounded-full bg-error-container px-2.5 py-0.5 font-label-sm text-label-sm text-on-error-container">
+                        <TriangleExclamation className="h-3 w-3" />
+                        Failed
                       </span>
                     ) : (
                       <span className="flex items-center gap-1 rounded-full bg-surface-container px-2.5 py-0.5 font-label-sm text-label-sm text-on-surface-variant">

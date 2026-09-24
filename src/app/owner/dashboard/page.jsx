@@ -51,7 +51,7 @@ function EmptyChartState({ icon: Icon, message }) {
 }
 
 export default function OwnerDashboardPage() {
-  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher);
+  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher, { refreshInterval: 30000 });
 
   // Scope the products query to just this owner's own devices (and drop
   // the base64 `image` field, which dashboards never render) — fetching
@@ -60,9 +60,9 @@ export default function OwnerDashboardPage() {
   const deviceIds = useMemo(() => (Array.isArray(devices) ? devices.map((d) => d._id) : []), [devices]);
   const productsKey =
     deviceIds.length > 0 ? `/api/proxy/products?deviceId=${deviceIds.join(",")}&noImages=true` : null;
-  const { data: products = [], isLoading: productsLoading } = useSWR(productsKey, fetcher);
+  const { data: products = [], isLoading: productsLoading } = useSWR(productsKey, fetcher, { refreshInterval: 30000 });
 
-  const { data: orders = [], isLoading: ordersLoading } = useSWR("/api/proxy/orders", fetcher);
+  const { data: orders = [], isLoading: ordersLoading } = useSWR("/api/proxy/orders", fetcher, { refreshInterval: 15000 });
 
   const loading = devicesLoading || productsLoading || ordersLoading;
 

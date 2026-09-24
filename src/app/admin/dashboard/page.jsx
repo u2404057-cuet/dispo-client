@@ -51,10 +51,10 @@ function EmptyChartState({ icon: Icon, message }) {
 }
 
 export default function AdminDashboardPage() {
-  const { data: users = [], isLoading: usersLoading } = useSWR("/api/proxy/users", fetcher);
-  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher);
-  const { data: products = [], isLoading: productsLoading } = useSWR("/api/proxy/products?noImages=true", fetcher);
-  const { data: orders = [], isLoading: ordersLoading } = useSWR("/api/proxy/orders", fetcher);
+  const { data: users = [], isLoading: usersLoading } = useSWR("/api/proxy/users", fetcher, { refreshInterval: 30000 });
+  const { data: devices = [], isLoading: devicesLoading } = useSWR("/api/proxy/devices", fetcher, { refreshInterval: 30000 });
+  const { data: products = [], isLoading: productsLoading } = useSWR("/api/proxy/products?noImages=true", fetcher, { refreshInterval: 30000 });
+  const { data: orders = [], isLoading: ordersLoading } = useSWR("/api/proxy/orders", fetcher, { refreshInterval: 15000 });
 
   const loading = usersLoading || devicesLoading || productsLoading || ordersLoading;
 

@@ -2,9 +2,83 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import useSWR from "swr";
+import { fetcher } from "@/lib/fetcher";
 import { useCart } from "@/lib/cart-context";
 import { toast, Spinner } from "@heroui/react";
-import { CircleCheck } from "@gravity-ui/icons";
+import { CircleCheck, Hourglass, TriangleExclamation } from "@gravity-ui/icons";
+
+const STATUS_CONFIG = {
+  pending: { icon: Hourglass, label: "Waiting for machine…", color: "text-on-surface-variant", spin: true },
+  dispensing: { icon: Spinner, label: "Dispensing your order…", color: "text-primary", spin: true },
+  completed: { icon: CircleCheck, label: "Order complete!", color: "text-primary", spin: false },
+  failed: { icon: TriangleExclamation, label: "Something went wrong", color: "text-error", spin: false },
+};
+
+function OrderStatusTracker({ orderId, deviceId }) {
+  const router = useRouter();
+
+  // Poll every 3s while the order is still in progress; stop once it
+  // reaches a terminal state so we're not burning requests forever.
+  const { data: order } = useSWR(
+    orderId ? `/api/proxy/orders/${orderId}` : null,
+    fetcher,
+    {
+      refreshInterval: (latestData) => {
+        if (!latestData) return 3000;
+        return latestData.status === "completed" || latestData.status === "failed" ? 0 : 3000;
+      },
+    }
+  );
+
+  const status = order?.status || "pending";
+  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
+  const Icon = cfg.icon;
+
+  // Show per-item dispense progress when available
+  const items = order?.items || [];
+  const totalUnits = items.reduce((s, i) => s + (i.qty || 0), 0);
+  const dispensedUnits = items.reduce((s, i) => s + (i.dispensedQty || 0), 0);
+
+  return (
+    <main className="flex min-h-[calc(100vh-73px)] flex-col items-center justify-center px-6 text-center">
+      <div className="mb-4">
+        {cfg.spin ? (
+          <Spinner size="lg" color="primary" />
+        ) : (
+          <Icon className={`h-10 w-10 ${cfg.color}`} />
+        )}
+      </div>
+
+      <h1 className="font-headline-lg text-headline-lg text-on-surface">{cfg.label}</h1>
+
+      <p className="font-body-md text-body-md text-on-surface-variant mt-1 max-w-xs">
+        Order #{orderId.slice(-6)} — ৳{order?.total ?? "…"}
+      </p>
+
+      {status === "dispensing" && totalUnits > 0 && (
+        <p className="font-body-sm text-body-sm text-on-surface-variant mt-2">
+          {dispensedUnits} of {totalUnits} item{totalUnits !== 1 ? "s" : ""} dispensed
+        </p>
+      )}
+
+      {status === "failed" && order?.failureReason && (
+        <p className="font-body-sm text-body-sm text-error mt-2">
+          Reason: {order.failureReason === "timeout" ? "The machine didn't respond in time." : order.failureReason}
+        </p>
+      )}
+
+      {(status === "completed" || status === "failed") && (
+        <button
+          onClick={() => router.push(`/shop/browse?device=${deviceId}`)}
+          className="mt-6 rounded-full bg-primary-container px-5 py-2.5 font-label-lg text-label-lg text-on-primary cursor-pointer"
+        >
+          Continue browsing
+        </button>
+      )}
+    </main>
+  );
+}
 
 export default function CheckoutPage() {
   const router = useRouter();
@@ -39,21 +113,7 @@ export default function CheckoutPage() {
   };
 
   if (confirmedOrder) {
-    return (
-      <main className="flex min-h-[calc(100vh-73px)] flex-col items-center justify-center px-6 text-center">
-        <CircleCheck className="h-10 w-10 text-primary mb-3" />
-        <h1 className="font-headline-lg text-headline-lg text-on-surface">Order placed</h1>
-        <p className="font-body-md text-body-md text-on-surface-variant mt-1 max-w-xs">
-          Order #{confirmedOrder._id.slice(-6)} — ৳{confirmedOrder.total} confirmed.
-        </p>
-        <button
-          onClick={() => router.push(`/shop/browse?device=${confirmedOrder.deviceId}`)}
-          className="mt-6 rounded-full bg-primary-container px-5 py-2.5 font-label-lg text-label-lg text-on-primary cursor-pointer"
-        >
-          Continue browsing
-        </button>
-      </main>
-    );
+    return <OrderStatusTracker orderId={confirmedOrder._id} deviceId={confirmedOrder.deviceId} />;
   }
 
   if (items.length === 0) {
@@ -97,3 +157,4 @@ export default function CheckoutPage() {
     </main>
   );
 }
+

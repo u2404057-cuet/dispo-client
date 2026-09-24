@@ -48,7 +48,8 @@ function CatalogPageContent() {
   } = useSWR("/api/proxy/products", fetcher, {
     onError: () => toast.danger("Couldn't load your catalog", { description: "Check your connection and try again." }),
   });
-  const { data: devices = [], isLoading: isLoadingDevices } = useSWR("/api/proxy/devices", fetcher);
+  const { data: devicesRaw = [], isLoading: isLoadingDevices } = useSWR("/api/proxy/devices", fetcher);
+  const devices = Array.isArray(devicesRaw) ? devicesRaw : [];
   const [deviceFilter, setDeviceFilter] = useState(""); // "" = show every device
 
   const {

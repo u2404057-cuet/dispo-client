@@ -37,6 +37,7 @@ function BrowsePageContent() {
 
   const productsUrl = deviceId ? `/api/proxy/products?deviceId=${deviceId}` : "/api/proxy/products";
   const { data: productsData, isLoading } = useSWR(productsUrl, fetcher, {
+    refreshInterval: 15000, // keep stock counts fresh while browsing
     onError: () => toast.danger("Couldn't load the catalog", { description: "Check your connection and try again." }),
   });
   const products = useMemo(() => (Array.isArray(productsData) ? productsData : []), [productsData]);
