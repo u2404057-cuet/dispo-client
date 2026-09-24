@@ -9,7 +9,7 @@ import { toast, Spinner } from "@heroui/react";
 import { CircleCheck, Hourglass, TriangleExclamation } from "@gravity-ui/icons";
 
 const STATUS_CONFIG = {
-  pending: { icon: Hourglass, label: "Waiting for machine…", color: "text-on-surface-variant", spin: true },
+  pending: { icon: Hourglass, label: "You're in queue!", color: "text-on-surface-variant", spin: true },
   dispensing: { icon: Spinner, label: "Dispensing your order…", color: "text-primary", spin: true },
   completed: { icon: CircleCheck, label: "Order complete!", color: "text-primary", spin: false },
   failed: { icon: TriangleExclamation, label: "Something went wrong", color: "text-error", spin: false },
@@ -55,6 +55,12 @@ function OrderStatusTracker({ orderId, deviceId }) {
       <p className="font-body-md text-body-md text-on-surface-variant mt-1 max-w-xs">
         Order #{orderId.slice(-6)} — ৳{order?.total ?? "…"}
       </p>
+
+      {status === "pending" && (
+        <p className="font-body-sm text-body-sm text-on-surface-variant mt-2 max-w-xs">
+          The machine is serving an earlier order. Your items will dispense automatically next!
+        </p>
+      )}
 
       {status === "dispensing" && totalUnits > 0 && (
         <p className="font-body-sm text-body-sm text-on-surface-variant mt-2">

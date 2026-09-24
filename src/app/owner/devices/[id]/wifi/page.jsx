@@ -159,14 +159,24 @@ export default function DeviceWifiSetupPage() {
         )}
 
         {!isConnected ? (
-          <button
-            onClick={handleConnect}
-            disabled={isConnecting}
-            className="flex w-full items-center justify-center gap-2 rounded-full bg-primary-container px-5 py-3.5 font-label-lg text-label-lg text-on-primary disabled:opacity-70 cursor-pointer"
-          >
-            {isConnecting ? <Spinner size="sm" color="current" /> : <PlugConnection className="h-4 w-4" />}
-            {isConnecting ? "Connecting…" : "Connect to board"}
-          </button>
+          <div className="flex flex-col gap-4">
+            <div className="rounded-2xl bg-surface-container-low p-4 text-left border border-outline-variant/30">
+              <p className="font-label-md text-label-md font-semibold text-on-surface mb-1">
+                🔘 Setup Button
+              </p>
+              <p className="font-body-sm text-body-sm text-on-surface-variant">
+                Hold the setup button on the machine for 3 seconds to enable Bluetooth mode, then click Connect below.
+              </p>
+            </div>
+            <button
+              onClick={handleConnect}
+              disabled={isConnecting}
+              className="flex w-full items-center justify-center gap-2 rounded-full bg-primary-container px-5 py-3.5 font-label-lg text-label-lg text-on-primary disabled:opacity-70 cursor-pointer"
+            >
+              {isConnecting ? <Spinner size="sm" color="current" /> : <PlugConnection className="h-4 w-4" />}
+              {isConnecting ? "Connecting…" : "Connect to board"}
+            </button>
+          </div>
         ) : (
           <form
             onSubmit={handleSubmit(onSubmit)}

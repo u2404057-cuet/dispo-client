@@ -1,47 +1,63 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
 
 #define DEVICE_NAME "EZConnect-Min"
 
+// ─── HiveMQ Cloud Configuration ──────────────────────────────────
+static const char* MQTT_BROKER = "97bee182514646a19ef2298dec106c52.s1.eu.hivemq.cloud"; 
+static const int   MQTT_PORT   = 8883;
+static const char* MQTT_USER   = "frontend_Server";
+static const char* MQTT_PASS   = "samm258258";
+
+// ─── BLE UUIDs ───────────────────────────────────────────────────
 static const char *SVC_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *RX_UUID  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *TX_UUID  = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
-// ─── Slot / Relay Configuration ──────────────────────────────────
+// ─── Hardware & Pin Configuration ────────────────────────────────
+const uint8_t BUTTON_PIN = 27; // Hold 3s to toggle Setup Mode
 const uint8_t MAX_SLOTS = 4;
 const uint8_t SLOT_PINS[MAX_SLOTS] = {12, 13, 14, 15};
-const uint32_t RELAY_PULSE_MS = 500;   // momentary "button press" duration
+const uint32_t RELAY_PULSE_MS = 500;
+const uint32_t DISPENSE_SETTLE_MS = 800;
+const uint32_t ORDER_MAX_DURATION_MS = 60000;
 
-// Most relay boards are active-LOW (a LOW signal energizes the coil).
-// Flip these two if your hardware is active-HIGH instead.
 static const uint8_t RELAY_ACTIVE_LEVEL = LOW;
 static const uint8_t RELAY_IDLE_LEVEL   = HIGH;
 
-// ─── MongoDB / Backend Configuration ──────────────────────────────
-static const char *SERVER_BASE_URL = "https://vending-server.vercel.app";
-static const uint32_t TELEMETRY_INTERVAL_MS = 30000; // heartbeat cadence
-static const uint32_t ORDER_POLL_INTERVAL_MS = 3000;  // how often we ask "anything to dispense?"
-static const uint32_t DISPENSE_SETTLE_MS = 800;       // gap between back-to-back pulses so the mechanism resets
-static const uint32_t ORDER_MAX_DURATION_MS = 60000;  // give up and report /fail if a single order runs longer than this
+// ─── Setup Mode & BLE State ──────────────────────────────────────
+static bool setupMode = false;
+static uint32_t setupStartTime = 0;
+static const uint32_t SETUP_TIMEOUT_MS = 60000;
+
+static BLEServer *bleServer = nullptr;
+static BLECharacteristic *txChar = nullptr;
+static bool bleConnected = false;
+static uint16_t bleConnId = 0;
+
+// ─── System Globals ──────────────────────────────────────────────
+static const uint32_t TELEMETRY_INTERVAL_MS = 30000;
 
 Preferences prefs;
-
 static portMUX_TYPE payloadMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool havePayload = false;
 static String payload = "";
+static String g_deviceId = "unprovisioned";
 
-static BLECharacteristic *txChar = nullptr;
+// ─── MQTT Globals ────────────────────────────────────────────────
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+static uint32_t lastReconnectAttempt = 0;
 
-static String g_deviceId = ""; // cached copy of the NVS-stored device id (this IS the qrToken)
-
-// ─── Relay State (thread-safe via portMUX) ───────────────────────
+// ─── Relay State ─────────────────────────────────────────────────
 struct RelayState {
   bool pulseActive;
   uint32_t pulseEndAt;
@@ -49,491 +65,169 @@ struct RelayState {
 static RelayState relayState[MAX_SLOTS];
 static portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ─── Pending-Order Dispense State ─────────────────────────────────
-// One order at a time, matching /api/devices/by-token/:token/pending-orders,
-// which deliberately hands back only the single oldest pending order. A
-// multi-unit line item (qty > 1) dispenses as that many separate pulses on
-// the same slot, one after another with a settle gap between them.
+// ─── Order Dispense State Machine ────────────────────────────────
 struct OrderItem {
   uint8_t slotNumber;
   uint8_t qty;
 };
 static bool orderActive = false;
 static String orderId = "";
-static OrderItem orderItems[MAX_SLOTS]; // an order can't reference more distinct slots than the board has
+static OrderItem orderItems[MAX_SLOTS];
 static uint8_t orderItemCount = 0;
 static uint8_t orderItemIdx = 0;
 static uint8_t orderUnitIdx = 0;
 static uint32_t orderSettleUntil = 0;
-static uint32_t orderStartedAt = 0; // millis() when this order became active — backstop for ORDER_MAX_DURATION_MS
-
-// Result of the last /pending-orders poll, handed from the background HTTP
-// task to loop() the same way `payload` is handed from the BLE callback.
-static portMUX_TYPE orderPollMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool havePendingOrderResult = false;
-static volatile bool orderPollInFlight = false;
-static String pendingOrderJson = "";
+static uint32_t orderStartedAt = 0;
 
 // ─── Forward Declarations ────────────────────────────────────────
 static void notifyStatus(const String &msg);
 static bool triggerSlot(uint8_t idx);
-static void sendJsonPostAsync(const String &path, const String &body);
+static void disableSetupMode();
+static void enableSetupMode();
 static uint32_t getEpochTime();
-static void pollPendingOrders();
-static void checkPendingOrderResult();
-static void driveOrderInProgress();
-static void checkOrderTimeout();
 static void advanceOrderProgress();
-static void patchUrlAsync(const String &url, const String &body);
-static void completeOrderAsync(const String &completedOrderId);
-static void reportProgressAsync(const String &forOrderId, uint8_t slotNumber);
-static void failOrderAsync(const String &forOrderId, const String &reason);
+static void completeOrder(const String &id);
+static void failOrder(const String &id, const String &reason);
+static void reportProgress(const String &id, uint8_t slotNumber);
 
-// ─── Bluetooth Callbacks ─────────────────────────────────────────
-class RxCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
-    uint8_t *data = c->getData();
-    size_t n = c->getLength();
-    if (!n) return;
-
-    Serial.printf("[ble ] received %u bytes: ", (unsigned)n);
-    for (size_t i = 0; i < n; i++) {
-      Serial.print((char)(data[i] >= 32 && data[i] < 127 ? data[i] : '.'));
-    }
-    Serial.println();
-
-    portENTER_CRITICAL(&payloadMux);
-    for (size_t i = 0; i < n; i++) {
-      payload += (char)data[i];
-    }
-    havePayload = true;
-    portEXIT_CRITICAL(&payloadMux);
-  }
-};
-
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s) override {
-    Serial.println("[ble ] phone connected — advertising stopped");
-  }
-  void onDisconnect(BLEServer *s) override {
-    Serial.println("[ble ] phone disconnected — restarting advertising");
-    delay(300);
-    BLEDevice::startAdvertising();
-  }
-};
-
-// ─── Send a status line back over BLE, safely ────────────────────
-static void notifyStatus(const String &msg) {
-  if (!txChar) return;
-  txChar->setValue(msg.c_str());
-  txChar->notify();
-  Serial.printf("[ble ] notified: %s\n", msg.c_str());
-}
-
-// ─── WiFi Reporting ──────────────────────────────────────────────
-static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.println("[wifi] associated with access point");
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.print("[wifi] CONNECTED, IP: ");
-      Serial.print(WiFi.localIP());
-      Serial.printf(", RSSI: %d dBm\n", WiFi.RSSI());
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
-      uint8_t r = info.wifi_sta_disconnected.reason;
-      const char *why = r == 15  ? "wrong password"
-                      : r == 201 ? "network not found (or 5GHz only)"
-                      : r == 205 ? "access point dropped connection" : "other";
-      Serial.printf("[wifi] disconnected, reason %u — %s\n", r, why);
-      break;
-    }
-    default: break;
-  }
-}
-
-static void connectWiFi(const String &ssid, const String &pass) {
-  notifyStatus("CONNECTING");
-
-  Serial.printf("[wifi] WiFi.begin(\"%s\", <%u char password>)\n", ssid.c_str(), pass.length());
-  WiFi.disconnect(true, false);
-  delay(150);
-  WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : nullptr);
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    Serial.print('.');
-    delay(500);
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[wifi] joined in %lu ms\n", millis() - start);
-    notifyStatus("CONNECTED," + WiFi.localIP().toString());
-    // Kick off NTP sync so /logs and /telemetry timestamps are real epoch time.
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  } else {
-    Serial.println("[wifi] connection timeout (20s)");
-    notifyStatus("FAILED");
-  }
-}
-
-// ─── Credentials Handling ────────────────────────────────────────
-static void handleDeviceId(String token) {
-  token.trim();
-  if (!token.length()) {
-    Serial.println("[dvi ] rejected — empty token");
-    notifyStatus("DEVICEID_FAILED");
+// ─── MQTT Callback (Processes incoming orders from backend) ──────
+void mqttCallback(char* topic, byte* message, unsigned int length) {
+  if (orderActive) {
+    Serial.printf("[mqtt] already dispensing order %s — ignoring duplicate push to protect hardware\n", orderId.c_str());
     return;
   }
 
-  Serial.printf("[dvi ] setting device ID: \"%s\"\n", token.c_str());
-
-  prefs.begin("device", false);
-  prefs.putString("id", token);
-  prefs.end();
-
-  // Read it back to actually confirm the write stuck, rather than just
-  // assuming putString() succeeded.
-  prefs.begin("device", true);
-  String stored = prefs.getString("id", "");
-  prefs.end();
-
-  if (stored == token) {
-    g_deviceId = stored;
-    Serial.println("[dvi ] saved to Flash memory");
-    notifyStatus("DEVICEID_SET");
-  } else {
-    Serial.println("[dvi ] verification failed after write");
-    notifyStatus("DEVICEID_FAILED");
-  }
-}
-
-static void handleSlotCommand(String numStr) {
-  numStr.trim();
-
-  bool numeric = numStr.length() > 0;
-  for (size_t i = 0; i < numStr.length() && numeric; i++) {
-    if (!isDigit(numStr[i])) numeric = false;
-  }
-  int n = numeric ? numStr.toInt() : -1;
-
-  if (n < 1 || n > MAX_SLOTS) {
-    Serial.printf("[slot] invalid slot token \"%s\"\n", numStr.c_str());
-    notifyStatus("INVALID_SLOT");
-    return;
-  }
-
-  triggerSlot((uint8_t)(n - 1));
-}
-
-static void handlePayload(String text) {
-  text.trim();
-  Serial.printf("[cred] parsing: \"%s\"\n", text.c_str());
-
-  if (text.startsWith("dvi_")) {
-    handleDeviceId(text.substring(4));
-    return;
-  }
-
-  if (text.startsWith("slot_")) {
-    handleSlotCommand(text.substring(5));
-    return;
-  }
-
-  int comma = text.indexOf(',');
-  if (comma <= 0) {
-    Serial.println("[cred] rejected — expected format: ssid,password");
-    return;
-  }
-
-  String ssid = text.substring(0, comma);
-  String pass = text.substring(comma + 1);
-  Serial.printf("[cred] ssid \"%s\", password length: %u\n", ssid.c_str(), pass.length());
-
-  prefs.begin("wifi", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
-  prefs.end();
-  Serial.println("[nvs ] saved to Flash memory");
-
-  connectWiFi(ssid, pass);
-}
-
-// ─── Relay Control (non-blocking, portMUX-protected) ─────────────
-static inline void relayWrite(uint8_t idx, bool on) {
-  digitalWrite(SLOT_PINS[idx], on ? RELAY_ACTIVE_LEVEL : RELAY_IDLE_LEVEL);
-}
-
-static bool triggerSlot(uint8_t idx) {
-  if (idx >= MAX_SLOTS) return false;
-
-  bool started = false;
-  portENTER_CRITICAL(&relayMux);
-  if (!relayState[idx].pulseActive) {
-    relayState[idx].pulseActive = true;
-    relayState[idx].pulseEndAt = millis() + RELAY_PULSE_MS;
-    started = true;
-  }
-  portEXIT_CRITICAL(&relayMux);
-
-  if (started) {
-    relayWrite(idx, true);
-    notifyStatus("SLOT_" + String(idx + 1) + "_ACTIVE");
-    Serial.printf("[slot] %u activated for %lu ms\n", idx + 1, (unsigned long)RELAY_PULSE_MS);
-  } else {
-    Serial.printf("[slot] %u busy, ignoring trigger\n", idx + 1);
-  }
-  return started;
-}
-
-static void logSlotExecution(uint8_t slotNumber) {
-  JsonDocument doc;
-  doc["deviceId"] = g_deviceId.length() ? g_deviceId : "unprovisioned";
-  doc["slotNumber"] = slotNumber;
-  doc["status"] = "COMPLETED";
-  doc["timestamp"] = getEpochTime();
-  doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
-
-  String body;
-  serializeJson(doc, body);
-  sendJsonPostAsync("/logs", body);
-}
-
-// Called every loop() iteration — turns off any relay whose pulse window
-// has elapsed and fires the completion notification + cloud log. If that
-// pulse belonged to the order currently being dispensed, also advances the
-// order's state machine to the next unit/item (or completes the order).
-static void serviceRelays() {
-  uint32_t now = millis();
-  for (uint8_t i = 0; i < MAX_SLOTS; i++) {
-    bool finished = false;
-    portENTER_CRITICAL(&relayMux);
-    if (relayState[i].pulseActive && (int32_t)(now - relayState[i].pulseEndAt) >= 0) {
-      relayState[i].pulseActive = false;
-      finished = true;
-    }
-    portEXIT_CRITICAL(&relayMux);
-
-    if (finished) {
-      relayWrite(i, false);
-      uint8_t slotNumber = i + 1;
-      notifyStatus("SLOT_" + String(slotNumber) + "_DONE");
-      Serial.printf("[slot] %u pulse complete\n", slotNumber);
-      logSlotExecution(slotNumber);
-
-      if (orderActive && orderItems[orderItemIdx].slotNumber == slotNumber) {
-        advanceOrderProgress();
-      }
-    }
-  }
-}
-
-// ─── MongoDB / Backend HTTP Integration ──────────────────────────
-static uint32_t getEpochTime() {
-  time_t now = time(nullptr);
-  // Before NTP sync, time(nullptr) returns a small number (seconds since boot
-  // reference of 1970) — treat anything before ~2023 as "not yet synced".
-  return now > 1700000000UL ? (uint32_t)now : 0;
-}
-
-struct HttpTaskParam {
-  String url;
-  String body;
-};
-
-static void httpPostTask(void *pv) {
-  HttpTaskParam *p = static_cast<HttpTaskParam *>(pv);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(p->url);
-    http.addHeader("Content-Type", "application/json");
-    int code = http.POST(p->body);
-    Serial.printf("[http] POST %s -> %d\n", p->url.c_str(), code);
-    http.end();
-  } else {
-    Serial.printf("[http] skipped POST %s — WiFi not connected\n", p->url.c_str());
-  }
-
-  delete p;
-  vTaskDelete(nullptr);
-}
-
-static void sendJsonPostAsync(const String &path, const String &body) {
-  HttpTaskParam *p = new HttpTaskParam{String(SERVER_BASE_URL) + path, body};
-  BaseType_t ok = xTaskCreate(httpPostTask, "httpPost", 8192, p, 1, nullptr);
-  if (ok != pdPASS) {
-    Serial.println("[http] failed to spawn POST task");
-    delete p;
-  }
-}
-
-// Fire-and-forget PATCH, same shape as the POST task above — used for every
-// order-status callback (complete / progress / fail), none of which need a
-// request body or a response back into loop().
-static void httpPatchTask(void *pv) {
-  HttpTaskParam *p = static_cast<HttpTaskParam *>(pv);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(p->url);
-    http.addHeader("Content-Type", "application/json");
-    int code = http.PATCH(p->body);
-    Serial.printf("[http] PATCH %s -> %d\n", p->url.c_str(), code);
-    http.end();
-  } else {
-    Serial.printf("[http] skipped PATCH %s — WiFi not connected\n", p->url.c_str());
-  }
-
-  delete p;
-  vTaskDelete(nullptr);
-}
-
-static void patchUrlAsync(const String &url, const String &body) {
-  HttpTaskParam *p = new HttpTaskParam{url, body};
-  BaseType_t ok = xTaskCreate(httpPatchTask, "httpPatch", 8192, p, 1, nullptr);
-  if (ok != pdPASS) {
-    Serial.println("[http] failed to spawn PATCH task");
-    delete p;
-  }
-}
-
-static void completeOrderAsync(const String &completedOrderId) {
-  patchUrlAsync(String(SERVER_BASE_URL) + "/api/devices/by-token/" + g_deviceId + "/orders/" + completedOrderId + "/complete", "");
-}
-
-// Called after every individual unit dispensed (not just once at the end)
-// so the server knows exactly how much of the order actually went out —
-// that's what lets /fail restore only the undispensed portion later.
-static void reportProgressAsync(const String &forOrderId, uint8_t slotNumber) {
-  patchUrlAsync(String(SERVER_BASE_URL) + "/api/devices/by-token/" + g_deviceId +
-                "/orders/" + forOrderId + "/items/" + String(slotNumber) + "/progress", "");
-}
-
-// Explicit "I couldn't finish this" report — the server's own timeout
-// sweep would eventually catch a truly dead/unreachable board anyway, but
-// reporting proactively means a recoverable problem (e.g. a jam we detect
-// locally) gets the customer's stock restored in seconds, not minutes.
-static void failOrderAsync(const String &forOrderId, const String &reason) {
-  JsonDocument doc;
-  doc["reason"] = reason;
-  String body;
-  serializeJson(doc, body);
-  patchUrlAsync(String(SERVER_BASE_URL) + "/api/devices/by-token/" + g_deviceId + "/orders/" + forOrderId + "/fail", body);
-}
-
-static void sendTelemetry() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  JsonDocument doc;
-  doc["deviceId"] = g_deviceId.length() ? g_deviceId : "unprovisioned";
-  doc["ip"] = WiFi.localIP().toString();
-  doc["rssi"] = WiFi.RSSI();
-  doc["freeHeap"] = ESP.getFreeHeap();
-  doc["uptimeSeconds"] = millis() / 1000;
-  doc["timestamp"] = getEpochTime();
-
-  String body;
-  serializeJson(doc, body);
-  sendJsonPostAsync("/telemetry", body);
-}
-
-// ─── Order Polling & Dispensing ───────────────────────────────────
-// GET runs in its own task (unlike the fire-and-forget POST/PATCH tasks,
-// this one needs its response body back), and hands the raw JSON to
-// loop() via the same copy-then-clear pattern used for BLE `payload`, so
-// ArduinoJson parsing — not thread-safe — only ever happens on the main
-// task.
-static void pollPendingOrdersTask(void *pv) {
-  String *urlPtr = static_cast<String *>(pv);
-  String url = *urlPtr;
-  delete urlPtr;
-
-  String result = "{}";
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(url);
-    int code = http.GET();
-    if (code == 200) {
-      result = http.getString();
-    } else {
-      Serial.printf("[ordr] poll GET -> %d\n", code);
-    }
-    http.end();
-  }
-
-  portENTER_CRITICAL(&orderPollMux);
-  pendingOrderJson = result;
-  havePendingOrderResult = true;
-  portEXIT_CRITICAL(&orderPollMux);
-
-  orderPollInFlight = false;
-  vTaskDelete(nullptr);
-}
-
-static void pollPendingOrders() {
-  if (orderPollInFlight) return; // previous poll hasn't finished yet — skip this tick
-  orderPollInFlight = true;
-  String *urlPtr = new String(String(SERVER_BASE_URL) + "/api/devices/by-token/" + g_deviceId + "/pending-orders");
-  BaseType_t ok = xTaskCreate(pollPendingOrdersTask, "pollOrders", 8192, urlPtr, 1, nullptr);
-  if (ok != pdPASS) {
-    Serial.println("[ordr] failed to spawn poll task");
-    delete urlPtr;
-    orderPollInFlight = false;
-  }
-}
-
-// Parses whatever the last poll came back with. {} (nothing pending) is
-// the common case and is silently ignored.
-static void checkPendingOrderResult() {
-  if (!havePendingOrderResult) return;
-
-  String json;
-  portENTER_CRITICAL(&orderPollMux);
-  json = pendingOrderJson;
-  havePendingOrderResult = false;
-  portEXIT_CRITICAL(&orderPollMux);
+  String json = "";
+  for (unsigned int i = 0; i < length; i++) json += (char)message[i];
+  Serial.printf("[mqtt] Order received on %s: %s\n", topic, json.c_str());
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, json);
   if (err) {
-    Serial.printf("[ordr] bad pending-orders JSON: %s\n", err.c_str());
+    Serial.printf("[mqtt] JSON parse error: %s\n", err.c_str());
     return;
   }
-  if (doc["orderId"].isNull()) return; // {} — nothing to dispense right now
 
-  String newOrderId = doc["orderId"].as<String>();
-  uint8_t count = 0;
+  // Handle direct slot test command if triggered
+  if (doc["slot"].is<int>()) {
+    triggerSlot((uint8_t)(doc["slot"].as<int>() - 1));
+    return;
+  }
+
+  if (doc["orderId"].isNull()) return;
+
+  orderId = doc["orderId"].as<String>();
+  orderItemCount = 0;
+
   for (JsonObject item : doc["items"].as<JsonArray>()) {
-    if (count >= MAX_SLOTS) break;
+    if (orderItemCount >= MAX_SLOTS) break;
     int slot = item["slotNumber"] | 0;
     int qty = item["qty"] | 0;
-    if (slot < 1 || slot > MAX_SLOTS || qty < 1) continue;
-    orderItems[count++] = OrderItem{(uint8_t)slot, (uint8_t)qty};
+    if (slot >= 1 && slot <= MAX_SLOTS && qty >= 1) {
+      orderItems[orderItemCount++] = OrderItem{(uint8_t)slot, (uint8_t)qty};
+    }
   }
-  if (count == 0) {
-    Serial.printf("[ordr] order %s had no valid items — skipping\n", newOrderId.c_str());
+
+  if (orderItemCount == 0) {
+    Serial.printf("[ordr] order %s had no valid items — skipping\n", orderId.c_str());
     return;
   }
 
-  orderId = newOrderId;
-  orderItemCount = count;
   orderItemIdx = 0;
   orderUnitIdx = 0;
   orderSettleUntil = 0;
   orderStartedAt = millis();
   orderActive = true;
-  Serial.printf("[ordr] order %s: %u line item(s) to dispense\n", orderId.c_str(), orderItemCount);
+  Serial.printf("[ordr] Starting order %s (%u line item(s))\n", orderId.c_str(), orderItemCount);
 }
 
-// Advances past one finished pulse: either the same slot needs another unit
-// (qty > 1), or it's time for the next line item, or the whole order is done.
-// Reports the unit that just finished before doing anything else, so a
-// progress ping is never skipped even if something below short-circuits.
+// ─── MQTT Connection & Topics ────────────────────────────────────
+void connectMQTT() {
+  if (mqtt.connected() || g_deviceId == "unprovisioned") return;
+  if (millis() - lastReconnectAttempt < 5000) return;
+  lastReconnectAttempt = millis();
+
+  Serial.printf("[mqtt] Connecting to HiveMQ Cloud as %s...\n", g_deviceId.c_str());
+
+  String statusTopic = "devices/" + g_deviceId + "/status";
+  String cmdTopic    = "devices/" + g_deviceId + "/dispense";
+
+  // Connect with Last Will & Testament (LWT)
+  if (mqtt.connect(g_deviceId.c_str(), MQTT_USER, MQTT_PASS, statusTopic.c_str(), 1, true, "offline")) {
+    Serial.println("[mqtt] CONNECTED!");
+    mqtt.publish(statusTopic.c_str(), "online", true);
+    mqtt.subscribe(cmdTopic.c_str(), 1);
+    Serial.printf("[mqtt] Subscribed to %s (instant push ready)\n", cmdTopic.c_str());
+  } else {
+    Serial.printf("[mqtt] connect failed, rc=%d. Retrying in 5s\n", mqtt.state());
+  }
+}
+
+// ─── MQTT Order Reporting & Telemetry ────────────────────────────
+static void completeOrder(const String &id) {
+  if (!mqtt.connected()) return;
+  String topic = "devices/" + g_deviceId + "/complete";
+  String body = "{\"orderId\":\"" + id + "\"}";
+  mqtt.publish(topic.c_str(), body.c_str(), true);
+  Serial.printf("[ordr] Order %s complete reported to cloud\n", id.c_str());
+}
+
+static void reportProgress(const String &id, uint8_t slotNumber) {
+  if (!mqtt.connected()) return;
+  String topic = "devices/" + g_deviceId + "/progress";
+  String body = "{\"orderId\":\"" + id + "\",\"slotNumber\":" + String(slotNumber) + "}";
+  mqtt.publish(topic.c_str(), body.c_str());
+  Serial.printf("[ordr] Order %s progress reported: slot %u\n", id.c_str(), slotNumber);
+}
+
+static void failOrder(const String &id, const String &reason) {
+  if (!mqtt.connected()) return;
+  String topic = "devices/" + g_deviceId + "/fail";
+  String body = "{\"orderId\":\"" + id + "\",\"reason\":\"" + reason + "\"}";
+  mqtt.publish(topic.c_str(), body.c_str(), true);
+  Serial.printf("[ordr] Order %s failed reported: %s\n", id.c_str(), reason.c_str());
+}
+
+static void sendTelemetry() {
+  if (!mqtt.connected()) return;
+
+  JsonDocument doc;
+  doc["deviceId"] = g_deviceId;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["setupMode"] = setupMode;
+  doc["timestamp"] = getEpochTime();
+
+  String body;
+  serializeJson(doc, body);
+  String telTopic = "devices/" + g_deviceId + "/telemetry";
+  mqtt.publish(telTopic.c_str(), body.c_str());
+}
+
+// ─── Dispense State Machine Driver ───────────────────────────────
+static void driveOrder() {
+  if (!orderActive) return;
+
+  // Timeout watchdog: abort order if mechanical jam lasts > 60s
+  if (millis() - orderStartedAt > ORDER_MAX_DURATION_MS) {
+    Serial.printf("[ordr] Order %s timed out — reporting failure\n", orderId.c_str());
+    failOrder(orderId, "device_timeout");
+    orderActive = false;
+    return;
+  }
+
+  // Settle gap between pulses
+  if (millis() < orderSettleUntil) return;
+
+  uint8_t slotIdx = orderItems[orderItemIdx].slotNumber - 1;
+  if (!relayState[slotIdx].pulseActive) {
+    triggerSlot(slotIdx);
+  }
+}
+
 static void advanceOrderProgress() {
-  reportProgressAsync(orderId, orderItems[orderItemIdx].slotNumber);
+  reportProgress(orderId, orderItems[orderItemIdx].slotNumber);
 
   orderUnitIdx++;
   if (orderUnitIdx < orderItems[orderItemIdx].qty) {
@@ -549,54 +243,212 @@ static void advanceOrderProgress() {
   }
 
   Serial.printf("[ordr] order %s fully dispensed\n", orderId.c_str());
-  completeOrderAsync(orderId);
+  completeOrder(orderId);
   orderActive = false;
 }
 
-// Backstop for a stuck order — e.g. a relay that never reports its pulse as
-// finished for some hardware reason not otherwise caught. The server's own
-// 5-minute timeout sweep is the ultimate safety net if this can't even
-// reach the network, but reporting locally recovers much faster when it can.
-static void checkOrderTimeout() {
-  if (!orderActive) return;
-  if (millis() - orderStartedAt < ORDER_MAX_DURATION_MS) return;
-
-  Serial.printf("[ordr] order %s exceeded %lu ms — reporting failure\n", orderId.c_str(), (unsigned long)ORDER_MAX_DURATION_MS);
-  failOrderAsync(orderId, "device_timeout");
-  orderActive = false;
+// ─── Relay Service & Completion ──────────────────────────────────
+static inline void relayWrite(uint8_t idx, bool on) {
+  digitalWrite(SLOT_PINS[idx], on ? RELAY_ACTIVE_LEVEL : RELAY_IDLE_LEVEL);
 }
 
-// Kicks off the next pulse for the order in progress, once the previous
-// pulse's settle window has passed and that slot isn't already mid-pulse
-// (e.g. from a stray manual BLE slot_ command).
-static void driveOrderInProgress() {
-  if (!orderActive) return;
-  if (millis() < orderSettleUntil) return;
+static bool triggerSlot(uint8_t idx) {
+  if (idx >= MAX_SLOTS) return false;
+  if (setupMode) {
+    notifyStatus("ERROR_SETUP_MODE_ACTIVE");
+    return false;
+  }
 
-  uint8_t slotIdx = orderItems[orderItemIdx].slotNumber - 1;
-
-  bool busy;
+  bool started = false;
   portENTER_CRITICAL(&relayMux);
-  busy = relayState[slotIdx].pulseActive;
+  if (!relayState[idx].pulseActive) {
+    relayState[idx].pulseActive = true;
+    relayState[idx].pulseEndAt = millis() + RELAY_PULSE_MS;
+    started = true;
+  }
   portEXIT_CRITICAL(&relayMux);
-  if (busy) return;
 
-  triggerSlot(slotIdx);
+  if (started) {
+    relayWrite(idx, true);
+    notifyStatus("SLOT_" + String(idx + 1) + "_ACTIVE");
+    Serial.printf("[slot] %u energized (500ms pulse)\n", idx + 1);
+  }
+  return started;
 }
 
-// ─── Setup & Loop ────────────────────────────────────────────────
+static void serviceRelays() {
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < MAX_SLOTS; i++) {
+    bool finished = false;
+    portENTER_CRITICAL(&relayMux);
+    if (relayState[i].pulseActive && (int32_t)(now - relayState[i].pulseEndAt) >= 0) {
+      relayState[i].pulseActive = false;
+      finished = true;
+    }
+    portEXIT_CRITICAL(&relayMux);
+
+    if (finished) {
+      relayWrite(i, false);
+      uint8_t slotNum = i + 1;
+      notifyStatus("SLOT_" + String(slotNum) + "_DONE");
+      Serial.printf("[slot] %u pulse complete\n", slotNum);
+
+      if (orderActive && orderItems[orderItemIdx].slotNumber == slotNum) {
+        advanceOrderProgress();
+      }
+    }
+  }
+}
+
+// ─── Bluetooth Callbacks ─────────────────────────────────────────
+class RxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    uint8_t *data = c->getData();
+    size_t n = c->getLength();
+    if (!n) return;
+
+    if (setupMode) setupStartTime = millis(); 
+
+    portENTER_CRITICAL(&payloadMux);
+    for (size_t i = 0; i < n; i++) payload += (char)data[i];
+    havePayload = true;
+    portEXIT_CRITICAL(&payloadMux);
+  }
+};
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
+    bleConnected = true;
+    bleConnId = param->connect.conn_id;
+    Serial.println("[ble ] client connected");
+  }
+  void onDisconnect(BLEServer *s) override {
+    bleConnected = false;
+    Serial.println("[ble ] client disconnected");
+    if (setupMode) {
+      delay(300);
+      BLEDevice::startAdvertising();
+    }
+  }
+};
+
+static void notifyStatus(const String &msg) {
+  if (!txChar || !bleConnected) return;
+  txChar->setValue(msg.c_str());
+  txChar->notify();
+}
+
+static void enableSetupMode() {
+  if (setupMode) return;
+  setupMode = true;
+  setupStartTime = millis();
+  BLEDevice::startAdvertising();
+  Serial.println("\n[mode] 🟢 SETUP MODE ENABLED (BLE active, holding for 60s)");
+}
+
+static void disableSetupMode() {
+  if (!setupMode) return;
+  setupMode = false;
+  if (bleConnected && bleServer != nullptr) {
+    bleServer->disconnect(bleConnId);
+    delay(100); 
+  }
+  BLEDevice::getAdvertising()->stop();
+  Serial.println("\n[mode] 🔴 SETUP MODE DISABLED (BLE stopped, secured)");
+}
+
+static void handleButtonAndTimeout() {
+  static bool lastBtnState = HIGH;
+  static uint32_t btnPressTime = 0;
+  static bool btnHandled = false;
+
+  bool currentBtnState = digitalRead(BUTTON_PIN);
+  if (currentBtnState == LOW && lastBtnState == HIGH) {
+    btnPressTime = millis();
+    btnHandled = false;
+  }
+  
+  if (currentBtnState == LOW && !btnHandled) {
+    if (millis() - btnPressTime >= 3000) {
+      if (setupMode) disableSetupMode();
+      else enableSetupMode();
+      btnHandled = true;
+    }
+  }
+  lastBtnState = currentBtnState;
+
+  if (setupMode && (millis() - setupStartTime >= SETUP_TIMEOUT_MS)) {
+    disableSetupMode();
+  }
+}
+
+// ─── WiFi & Credentials ──────────────────────────────────────────
+static void connectWiFi(const String &ssid, const String &pass) {
+  notifyStatus("CONNECTING");
+  Serial.printf("[wifi] connecting to \"%s\"...\n", ssid.c_str());
+  WiFi.disconnect(true, false);
+  delay(150);
+  WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : nullptr);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    handleButtonAndTimeout(); 
+    delay(10); 
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[wifi] CONNECTED, IP: %s\n", WiFi.localIP().toString().c_str());
+    notifyStatus("CONNECTED," + WiFi.localIP().toString());
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  } else {
+    Serial.println("[wifi] connection failed");
+    notifyStatus("FAILED");
+  }
+}
+
+static void handlePayload(String text) {
+  text.trim();
+  Serial.printf("[ble ] payload received: \"%s\"\n", text.c_str());
+
+  if (text.startsWith("dvi_")) {
+    g_deviceId = text.substring(4);
+    prefs.begin("device", false);
+    prefs.putString("id", g_deviceId);
+    prefs.end();
+    Serial.printf("[dvi ] saved device ID: %s\n", g_deviceId.c_str());
+    if (mqtt.connected()) mqtt.disconnect(); 
+    notifyStatus("DEVICEID_SET");
+    return;
+  }
+
+  if (text.startsWith("slot_")) {
+    int s = text.substring(5).toInt();
+    triggerSlot((uint8_t)(s - 1));
+    return;
+  }
+
+  int comma = text.indexOf(',');
+  if (comma > 0) {
+    String ssid = text.substring(0, comma);
+    String pass = text.substring(comma + 1);
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    connectWiFi(ssid, pass);
+  }
+}
+
+static uint32_t getEpochTime() {
+  time_t now = time(nullptr);
+  return now > 1700000000UL ? (uint32_t)now : 0;
+}
+
+// ─── Setup & Main Loop ───────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP); 
 
-  uint32_t serialStart = millis();
-  while (!Serial && (millis() - serialStart < 3000));
-
-  delay(300);
-  Serial.println("\n=================================================");
-  Serial.printf ("  CafeESP Coffee Machine Controller | Free Heap: %u bytes\n", (unsigned)ESP.getFreeHeap());
-  Serial.println("=================================================");
-
-  // Safe pin init — every slot starts OFF before anything else can touch it.
   for (uint8_t i = 0; i < MAX_SLOTS; i++) {
     relayState[i].pulseActive = false;
     relayState[i].pulseEndAt = 0;
@@ -605,31 +457,26 @@ void setup() {
   }
 
   WiFi.mode(WIFI_STA);
-  WiFi.onEvent(onWiFiEvent);
+  secureClient.setInsecure();
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(2048);
 
   BLEDevice::init(DEVICE_NAME);
-  BLEServer *bleServer = BLEDevice::createServer();
+  bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
-
   BLEService *svc = bleServer->createService(SVC_UUID);
 
-  BLECharacteristic *rx = svc->createCharacteristic(
-      RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  BLECharacteristic *rx = svc->createCharacteristic(RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   rx->setCallbacks(new RxCallbacks());
 
   txChar = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
   txChar->addDescriptor(new BLE2902());
-
   svc->start();
-
+  
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
-  BLEDevice::startAdvertising();
-
-  Serial.printf("[ble ] advertising as \"%s\"\n", DEVICE_NAME);
-  Serial.printf("[ble ] write \"ssid,password\", \"dvi_<id>\" or \"slot_<n>\" to %s\n", RX_UUID);
-  Serial.printf("[ble ] status notifications on %s\n", TX_UUID);
 
   prefs.begin("wifi", true);
   String ssid = prefs.getString("ssid", "");
@@ -637,69 +484,49 @@ void setup() {
   prefs.end();
 
   prefs.begin("device", true);
-  g_deviceId = prefs.getString("id", "");
+  String savedId = prefs.getString("id", "");
+  if (savedId.length() > 0) g_deviceId = savedId;
   prefs.end();
-  if (g_deviceId.length()) {
-    Serial.printf("[dvi ] device ID on file: %s\n", g_deviceId.c_str());
-  } else {
-    Serial.println("[dvi ] no device ID stored yet — waiting for admin to provision this board");
-  }
+
+  Serial.printf("[boot] Device ID on file: %s\n", g_deviceId.c_str());
 
   if (ssid.length()) {
-    Serial.printf("[nvs ] found saved network \"%s\"\n", ssid.c_str());
     connectWiFi(ssid, pass);
   } else {
-    Serial.println("[nvs ] no credentials stored — listening over BLE");
+    Serial.println("[boot] No WiFi configured — entering Setup Mode automatically");
+    enableSetupMode();
   }
 }
 
 void loop() {
-  static uint32_t settleAt = 0;
+  handleButtonAndTimeout();
 
   if (havePayload) {
-    if (!settleAt) settleAt = millis() + 400;
-    if (millis() > settleAt) {
-      String text;
-
-      portENTER_CRITICAL(&payloadMux);
-      text = payload;
-      payload = "";
-      havePayload = false;
-      portEXIT_CRITICAL(&payloadMux);
-
-      settleAt = 0;
-      handlePayload(text);
-    }
+    String text;
+    portENTER_CRITICAL(&payloadMux);
+    text = payload;
+    payload = "";
+    havePayload = false;
+    portEXIT_CRITICAL(&payloadMux);
+    handlePayload(text);
   }
 
   serviceRelays();
-  driveOrderInProgress();
-  checkPendingOrderResult();
-  checkOrderTimeout();
+  driveOrder();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqtt.connected()) {
+      connectMQTT();
+    } else {
+      mqtt.loop();
+    }
+  }
 
   static uint32_t lastTelemetry = 0;
   if (millis() - lastTelemetry > TELEMETRY_INTERVAL_MS) {
     lastTelemetry = millis();
     sendTelemetry();
   }
-
-  // Only ask for work when we're not already mid-dispense — the endpoint
-  // hands back one order at a time on purpose, so there's nothing new to
-  // fetch until the current one is finished and marked complete.
-  static uint32_t lastOrderPoll = 0;
-  if (!orderActive && g_deviceId.length() && WiFi.status() == WL_CONNECTED &&
-      millis() - lastOrderPoll > ORDER_POLL_INTERVAL_MS) {
-    lastOrderPoll = millis();
-    pollPendingOrders();
-  }
-
-  static uint32_t lastHb = 0;
-  if (millis() - lastHb > 10000) {
-    lastHb = millis();
-    Serial.printf("[ hb ] wifi: %s | free heap: %u\n",
-                  WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "not connected",
-                  (unsigned)ESP.getFreeHeap());
-  }
-
-  delay(10);
+  
+  delay(10); 
 }

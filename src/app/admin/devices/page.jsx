@@ -396,7 +396,7 @@ export default function AdminDevicesPage() {
               Connect to the board
             </h2>
             <p className="font-body-sm text-body-sm text-on-surface-variant">
-              Power on the machine, then connect over Bluetooth to give it its device ID.
+              Power on the machine (or hold the setup button on the board for 3 seconds), then connect over Bluetooth to give it its device ID.
             </p>
 
             {!isSupported ? (
